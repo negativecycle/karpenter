@@ -24,6 +24,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	schedulingv1 "k8s.io/api/scheduling/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
@@ -145,5 +146,37 @@ var _ = Describe("PodEvents", func() {
 
 		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 		Expect(nodeClaim.Status.LastPodEventTime.Time).ToNot(BeEquivalentTo(timeToCheck))
+	})
+	Context("Expendable Pods", func() {
+		var expendablePod *corev1.Pod
+
+		BeforeEach(func() {
+			// Pod priority is resolved from a PriorityClass by the Priority admission plugin, which rejects pods that set
+			// spec.priority directly
+			priorityClass := &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: test.RandomName()}, Value: -100}
+			ExpectApplied(ctx, env.Client, priorityClass)
+			DeferCleanup(func() { ExpectDeleted(ctx, env.Client, priorityClass) })
+			expendablePod = test.Pod(test.PodOptions{
+				NodeName:          node.Name,
+				PriorityClassName: priorityClass.Name,
+			})
+		})
+		It("should not set the nodeclaim lastPodEvent for a pod below the cutoff", func() {
+			// Backfill pods churn constantly, so counting them would hold the node under consolidateAfter indefinitely
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{ExpendablePodsPriorityCutoff: new(int32(-10))}))
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, expendablePod)
+			ExpectObjectReconciled(ctx, env.Client, podEventsController, expendablePod)
+
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(nodeClaim.Status.LastPodEventTime.Time).To(BeZero())
+		})
+		It("should set the nodeclaim lastPodEvent for a low priority pod when the cutoff is left at the default", func() {
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, expendablePod)
+			timeToCheck := env.Clock.Now().Truncate(time.Second)
+			ExpectObjectReconciled(ctx, env.Client, podEventsController, expendablePod)
+
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(nodeClaim.Status.LastPodEventTime.Time).To(BeEquivalentTo(timeToCheck))
+		})
 	})
 })

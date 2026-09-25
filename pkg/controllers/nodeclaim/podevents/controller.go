@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
@@ -64,6 +65,11 @@ func (c *Controller) Reconcile(ctx context.Context, pod *corev1.Pod) (reconcile.
 	// If the pod doesn't have a node name, we don't know which node this pod refers to.
 	// or if this is a daemonset
 	if pod.Spec.NodeName == "" || podutils.IsOwnedByDaemonSet(pod) {
+		return reconcile.Result{}, nil
+	}
+	// Expendable pods don't need to reschedule during consolidation, so like DaemonSet pods they shouldn't hold the node
+	// under consolidateAfter. Backfill workloads churn constantly and would otherwise keep the node from ever consolidating.
+	if podutils.IsExpendable(pod, options.FromContext(ctx).ExpendablePodsPriorityCutoff) {
 		return reconcile.Result{}, nil
 	}
 
