@@ -21,7 +21,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -94,6 +96,8 @@ type Options struct {
 	minValuesPolicyRaw               string
 	MinValuesPolicy                  MinValuesPolicy
 	IgnoreDRARequests                bool // NOTE: This flag will be removed once formal DRA support is GA in Karpenter.
+	expendablePodsPriorityCutoffRaw  string
+	ExpendablePodsPriorityCutoff     int32
 	FeatureGates                     FeatureGates
 	schedulerConfigRaw               string
 	SchedulerConfig                  *SchedulerConfiguration
@@ -138,6 +142,7 @@ func (o *Options) AddFlags(fs *FlagSet) {
 	fs.StringVar(&o.preferencePolicyRaw, "preference-policy", env.WithDefaultString("PREFERENCE_POLICY", string(PreferencePolicyRespect)), "How the Karpenter scheduler should treat preferences. Preferences include preferredDuringSchedulingIgnoreDuringExecution node and pod affinities/anti-affinities and ScheduleAnyways topologySpreadConstraints. Can be one of 'Ignore' and 'Respect'")
 	fs.StringVar(&o.minValuesPolicyRaw, "min-values-policy", env.WithDefaultString("MIN_VALUES_POLICY", string(MinValuesPolicyStrict)), "Min values policy for scheduling. Options include 'Strict' for existing behavior where min values are strictly enforced or 'BestEffort' where Karpenter relaxes min values when it isn't satisfied.")
 	fs.BoolVarWithEnv(&o.IgnoreDRARequests, "ignore-dra-requests", "IGNORE_DRA_REQUESTS", true, "When set, Karpenter will ignore pods' DRA requests during scheduling simulations. NOTE: This flag will be removed once formal DRA support is GA in Karpenter.")
+	fs.StringVar(&o.expendablePodsPriorityCutoffRaw, "expendable-pods-priority-cutoff", env.WithDefaultString("EXPENDABLE_PODS_PRIORITY_CUTOFF", ""), "Pods with priority strictly below this value are expendable: Karpenter does not provision capacity for them and does not require them to be rescheduled during disruption. Pods without a priority are never expendable. Must be an int32. Empty (the default) disables the behavior.")
 	fs.StringVar(&o.FeatureGates.inputStr, "feature-gates", env.WithDefaultString("FEATURE_GATES", "NodeRepair=false,ReservedCapacity=true,SpotToSpotConsolidation=false,NodeOverlay=false,StaticCapacity=false,CapacityBuffer=false,TerminateFirstDrift=false"), "Optional features can be enabled / disabled using feature gates. Current options are: NodeRepair, ReservedCapacity, SpotToSpotConsolidation, NodeOverlay, StaticCapacity, CapacityBuffer, and TerminateFirstDrift.")
 	fs.StringVar(&o.schedulerConfigRaw, "scheduler-config", env.WithDefaultString("SCHEDULER_CONFIG", ""), "A YAML/JSON document configuring the parts of the cluster's kube-scheduler behavior that Karpenter must mirror during scheduling simulation, currently only podTopologySpread.defaultConstraints. Empty means no scheduler-config overrides.")
 }
@@ -158,6 +163,10 @@ func (o *Options) Parse(fs *FlagSet, args ...string) error {
 	if !lo.Contains([]MinValuesPolicy{MinValuesPolicyStrict, MinValuesPolicyBestEffort}, MinValuesPolicy(o.minValuesPolicyRaw)) {
 		return fmt.Errorf("validating cli flags / env vars, invalid MIN_VALUES_POLICY %q", o.minValuesPolicyRaw)
 	}
+	expendablePodsPriorityCutoff, err := parseExpendablePodsPriorityCutoff(o.expendablePodsPriorityCutoffRaw)
+	if err != nil {
+		return fmt.Errorf("validating cli flags / env vars, invalid EXPENDABLE_PODS_PRIORITY_CUTOFF %q, %w", o.expendablePodsPriorityCutoffRaw, err)
+	}
 	if o.CPURequests <= 0 {
 		o.CPURequests = 1000
 	}
@@ -173,7 +182,21 @@ func (o *Options) Parse(fs *FlagSet, args ...string) error {
 	o.SchedulerConfig = schedulerConfig
 	o.PreferencePolicy = PreferencePolicy(o.preferencePolicyRaw)
 	o.MinValuesPolicy = MinValuesPolicy(o.minValuesPolicyRaw)
+	o.ExpendablePodsPriorityCutoff = expendablePodsPriorityCutoff
 	return nil
+}
+
+// parseExpendablePodsPriorityCutoff parses the cutoff as an int32. An empty value disables the behavior, which is
+// represented as math.MinInt32 since no pod's priority can fall below it.
+func parseExpendablePodsPriorityCutoff(raw string) (int32, error) {
+	if raw == "" {
+		return math.MinInt32, nil
+	}
+	cutoff, err := strconv.ParseInt(raw, 10, 32)
+	if err != nil {
+		return 0, err
+	}
+	return int32(cutoff), nil
 }
 
 func (o *Options) ToContext(ctx context.Context) context.Context {

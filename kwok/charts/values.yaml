@@ -138,6 +138,10 @@ settings:
   preferencePolicy: Respect
   # -- How the Karpenter scheduler treats min values. Options include 'Strict' (fails scheduling when min values can't be met) and 'BestEffort' (relaxes min values when they can't be met).
   minValuesPolicy: Strict
+  # -- (int) Pods with a priority strictly below this value are expendable: Karpenter does not provision capacity for them
+  # and does not require them to be rescheduled during disruption. Pods without a priority are never expendable. Must fit
+  # in an int32. Empty (the default) leaves it unset, so no pod is expendable.
+  expendablePodsPriorityCutoff: ""
   # -- Configures the parts of the cluster's kube-scheduler behavior that Karpenter must mirror during scheduling simulation,
   # currently only podTopologySpread.defaultConstraints. Set this to the same defaultConstraints your kube-scheduler's
   # PodTopologySpread plugin is configured with, so Karpenter accounts for the constraints those pods will actually be

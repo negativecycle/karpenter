@@ -18,6 +18,7 @@ package test
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/imdario/mergo"
@@ -49,6 +50,7 @@ type OptionsFields struct {
 	BatchMaxDuration                 *time.Duration
 	BatchIdleDuration                *time.Duration
 	IgnoreDRARequests                *bool
+	ExpendablePodsPriorityCutoff     *int32
 	FeatureGates                     FeatureGates
 	SchedulerConfig                  *options.SchedulerConfiguration
 }
@@ -92,6 +94,7 @@ func Options(overrides ...OptionsFields) *options.Options {
 		MinValuesPolicy:                  lo.FromPtrOr(opts.MinValuesPolicy, options.MinValuesPolicyStrict),
 		IgnoreDRARequests:                lo.FromPtrOr(opts.IgnoreDRARequests, true),
 		SchedulerConfig:                  opts.SchedulerConfig,
+		ExpendablePodsPriorityCutoff:     lo.FromPtrOr(opts.ExpendablePodsPriorityCutoff, int32(math.MinInt32)),
 		FeatureGates: options.FeatureGates{
 			NodeRepair:              lo.FromPtrOr(opts.FeatureGates.NodeRepair, false),
 			ReservedCapacity:        lo.FromPtrOr(opts.FeatureGates.ReservedCapacity, true),

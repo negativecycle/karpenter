@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/pprof"
 	"runtime"
@@ -134,6 +135,16 @@ func WithLeaderElectionConfig(config *rest.Config) option.Function[Options] {
 	}
 }
 
+// logBehaviorOptions logs the options that change how Karpenter schedules pods, when they are set
+func logBehaviorOptions(ctx context.Context) {
+	if cfg := options.FromContext(ctx).SchedulerConfig; cfg != nil && cfg.PodTopologySpread != nil && len(cfg.PodTopologySpread.DefaultConstraints) != 0 {
+		log.FromContext(ctx).WithValues("default-topology-spread-constraints", cfg.PodTopologySpread.DefaultConstraints).Info("scheduler-config is set: applying these default topology spread constraints during scheduling to pods that declare none of their own")
+	}
+	if cutoff := options.FromContext(ctx).ExpendablePodsPriorityCutoff; cutoff != math.MinInt32 {
+		log.FromContext(ctx).WithValues("expendable-pods-priority-cutoff", cutoff).Info("expendable-pods-priority-cutoff is set: not provisioning capacity for pods with a lower priority, and not requiring them to reschedule during disruption")
+	}
+}
+
 // NewOperator instantiates a controller manager or panics
 func NewOperator(o ...option.Function[Options]) (context.Context, *Operator) {
 	opts := option.Resolve(o...)
@@ -179,9 +190,7 @@ func NewOperator(o ...option.Function[Options]) (context.Context, *Operator) {
 
 	log.FromContext(ctx).WithValues("version", Version).V(1).Info("discovered karpenter version")
 
-	if cfg := options.FromContext(ctx).SchedulerConfig; cfg != nil && cfg.PodTopologySpread != nil && len(cfg.PodTopologySpread.DefaultConstraints) != 0 {
-		log.FromContext(ctx).WithValues("default-topology-spread-constraints", cfg.PodTopologySpread.DefaultConstraints).Info("scheduler-config is set: applying these default topology spread constraints during scheduling to pods that declare none of their own")
-	}
+	logBehaviorOptions(ctx)
 
 	// Manager
 	mgrOpts := ctrl.Options{

@@ -20,6 +20,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"reflect"
 	"testing"
@@ -67,6 +68,7 @@ var _ = Describe("Options", func() {
 		"MIN_VALUES_POLICY",
 		"FEATURE_GATES",
 		"SCHEDULER_CONFIG",
+		"EXPENDABLE_PODS_PRIORITY_CUTOFF",
 	}
 
 	BeforeEach(func() {
@@ -130,8 +132,9 @@ var _ = Describe("Options", func() {
 					StaticCapacity:          new(false),
 					CapacityBuffer:          new(false),
 				},
-				IgnoreDRARequests: new(true),
-				SchedulerConfig:   nil,
+				IgnoreDRARequests:            new(true),
+				ExpendablePodsPriorityCutoff: lo.ToPtr[int32](math.MinInt32),
+				SchedulerConfig:              nil,
 			}))
 		})
 
@@ -159,6 +162,7 @@ var _ = Describe("Options", func() {
 				"--batch-idle-duration", "5s",
 				"--preference-policy", "Ignore",
 				"--min-values-policy", "BestEffort",
+				"--expendable-pods-priority-cutoff", "-100",
 				"--feature-gates", "ReservedCapacity=false,SpotToSpotConsolidation=true,NodeRepair=true,NodeOverlay=true,StaticCapacity=true,CapacityBuffer=true",
 				"--scheduler-config", `{"podTopologySpread":{"defaultConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"ScheduleAnyway"}]}}`,
 			)
@@ -191,7 +195,8 @@ var _ = Describe("Options", func() {
 					StaticCapacity:          new(true),
 					CapacityBuffer:          new(true),
 				},
-				IgnoreDRARequests: new(true),
+				IgnoreDRARequests:            new(true),
+				ExpendablePodsPriorityCutoff: lo.ToPtr[int32](-100),
 				SchedulerConfig: &options.SchedulerConfiguration{
 					PodTopologySpread: &options.PodTopologySpreadConfig{
 						DefaultConstraints: []corev1.TopologySpreadConstraint{{
@@ -224,6 +229,7 @@ var _ = Describe("Options", func() {
 			os.Setenv("BATCH_IDLE_DURATION", "5s")
 			os.Setenv("PREFERENCE_POLICY", "Ignore")
 			os.Setenv("MIN_VALUES_POLICY", "BestEffort")
+			os.Setenv("EXPENDABLE_PODS_PRIORITY_CUTOFF", "-10")
 			os.Setenv("FEATURE_GATES", "ReservedCapacity=false,SpotToSpotConsolidation=true,NodeRepair=true,NodeOverlay=true,StaticCapacity=true,CapacityBuffer=true")
 			os.Setenv("SCHEDULER_CONFIG", `{"podTopologySpread":{"defaultConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"ScheduleAnyway"}]}}`)
 			fs = &options.FlagSet{
@@ -260,7 +266,8 @@ var _ = Describe("Options", func() {
 					StaticCapacity:          new(true),
 					CapacityBuffer:          new(true),
 				},
-				IgnoreDRARequests: new(true),
+				IgnoreDRARequests:            new(true),
+				ExpendablePodsPriorityCutoff: lo.ToPtr[int32](-10),
 				SchedulerConfig: &options.SchedulerConfiguration{
 					PodTopologySpread: &options.PodTopologySpreadConfig{
 						DefaultConstraints: []corev1.TopologySpreadConstraint{{
@@ -288,6 +295,7 @@ var _ = Describe("Options", func() {
 			os.Setenv("BATCH_IDLE_DURATION", "5s")
 			os.Setenv("PREFERENCE_POLICY", "Ignore")
 			os.Setenv("MIN_VALUES_POLICY", "BestEffort")
+			os.Setenv("EXPENDABLE_PODS_PRIORITY_CUTOFF", "-10")
 			os.Setenv("FEATURE_GATES", "ReservedCapacity=false,SpotToSpotConsolidation=true,NodeRepair=true,NodeOverlay=true,StaticCapacity=true,CapacityBuffer=true")
 			fs = &options.FlagSet{
 				FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError),
@@ -300,6 +308,7 @@ var _ = Describe("Options", func() {
 				"--log-error-output-paths", "/etc/k8s/testerror",
 				"--preference-policy", "Respect",
 				"--min-values-policy", "Strict",
+				"--expendable-pods-priority-cutoff", "-100",
 			)
 			Expect(err).To(BeNil())
 			expectOptionsMatch(opts, test.Options(test.OptionsFields{
@@ -330,7 +339,8 @@ var _ = Describe("Options", func() {
 					StaticCapacity:          new(true),
 					CapacityBuffer:          new(true),
 				},
-				IgnoreDRARequests: new(true),
+				IgnoreDRARequests:            new(true),
+				ExpendablePodsPriorityCutoff: lo.ToPtr[int32](-100),
 			}))
 		})
 
@@ -400,6 +410,34 @@ var _ = Describe("Options", func() {
 			Entry("zero is provided", "0"),
 			Entry("negative value is provided", "-50"),
 		)
+		DescribeTable(
+			"should parse an EXPENDABLE_PODS_PRIORITY_CUTOFF",
+			func(value string, expected int32) {
+				Expect(opts.Parse(fs, "--expendable-pods-priority-cutoff", value)).To(Succeed())
+				Expect(opts.ExpendablePodsPriorityCutoff).To(Equal(expected))
+			},
+			Entry("empty disables it", "", int32(math.MinInt32)),
+			Entry("minimum int32", "-2147483648", int32(math.MinInt32)),
+			Entry("maximum int32", "2147483647", int32(math.MaxInt32)),
+		)
+		DescribeTable(
+			"should error with an invalid EXPENDABLE_PODS_PRIORITY_CUTOFF",
+			func(value string) {
+				Expect(opts.Parse(fs, "--expendable-pods-priority-cutoff", value)).ToNot(Succeed())
+			},
+			Entry("not a number", "abc"),
+			Entry("not an integer", "1.5"),
+			Entry("above int32", "2147483648"),
+			Entry("below int32", "-2147483649"),
+		)
+		It("should error with an invalid EXPENDABLE_PODS_PRIORITY_CUTOFF environment variable", func() {
+			os.Setenv("EXPENDABLE_PODS_PRIORITY_CUTOFF", "abc")
+			fs = &options.FlagSet{
+				FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError),
+			}
+			opts.AddFlags(fs)
+			Expect(opts.Parse(fs)).ToNot(Succeed())
+		})
 	})
 
 })
@@ -580,4 +618,5 @@ func expectOptionsMatch(optsA, optsB *options.Options) {
 	Expect(optsA.FeatureGates.SpotToSpotConsolidation).To(Equal(optsB.FeatureGates.SpotToSpotConsolidation))
 	Expect(optsA.IgnoreDRARequests).To(Equal(optsB.IgnoreDRARequests))
 	Expect(optsA.SchedulerConfig).To(Equal(optsB.SchedulerConfig))
+	Expect(optsA.ExpendablePodsPriorityCutoff).To(Equal(optsB.ExpendablePodsPriorityCutoff))
 }

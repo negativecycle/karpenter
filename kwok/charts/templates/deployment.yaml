@@ -118,6 +118,13 @@ spec:
             - name: MIN_VALUES_POLICY
               value: "{{ . }}"
           {{- end }}
+          {{- /* Not `with`: it would skip a cutoff of 0. A number from a values file is a float64, which renders as e.g. 1e+09,
+          so print whole numbers as integers and pass anything else through for Karpenter to reject. */}}
+          {{- $expendablePodsPriorityCutoff := .Values.settings.expendablePodsPriorityCutoff }}
+          {{- if not (or (kindIs "invalid" $expendablePodsPriorityCutoff) (eq (toString $expendablePodsPriorityCutoff) "")) }}
+            - name: EXPENDABLE_PODS_PRIORITY_CUTOFF
+              value: "{{ if and (kindIs "float64" $expendablePodsPriorityCutoff) (eq $expendablePodsPriorityCutoff (float64 (int64 $expendablePodsPriorityCutoff))) }}{{ int64 $expendablePodsPriorityCutoff }}{{ else }}{{ $expendablePodsPriorityCutoff }}{{ end }}"
+          {{- end }}
           {{- with .Values.settings.schedulerConfig }}
             - name: SCHEDULER_CONFIG
               value: |

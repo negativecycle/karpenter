@@ -18,6 +18,7 @@ package pod_test
 
 import (
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -292,5 +293,29 @@ var _ = Describe("HasDRARequirements", func() {
 			},
 		}
 		Expect(pod.HasDRARequirements(p)).To(BeTrue())
+	})
+})
+
+var _ = Describe("IsExpendable", func() {
+	withPriority := func(priority *int32) *corev1.Pod {
+		return &corev1.Pod{Spec: corev1.PodSpec{Priority: priority}}
+	}
+	DescribeTable("should compare priority strictly against the cutoff",
+		func(priority *int32, cutoff int32, expected bool) {
+			Expect(pod.IsExpendable(withPriority(priority), cutoff)).To(Equal(expected))
+		},
+		Entry("default cutoff with the lowest possible priority", new(int32(math.MinInt32)), int32(math.MinInt32), false),
+		Entry("no priority on the pod", nil, int32(-10), false),
+		Entry("below the cutoff", new(int32(-100)), int32(-10), true),
+		Entry("equal to the cutoff", new(int32(-10)), int32(-10), false),
+		Entry("above the cutoff", new(int32(0)), int32(-10), false),
+		Entry("cutoff of zero with a negative priority", new(int32(-1)), int32(0), true),
+	)
+	It("should treat a pod as expendable even when its preemptionPolicy is Never", func() {
+		// preemptionPolicy governs whether a pod may preempt others, not whether it
+		// may be preempted, and low-priority pods commonly set Never.
+		p := withPriority(new(int32(-100)))
+		p.Spec.PreemptionPolicy = new(corev1.PreemptNever)
+		Expect(pod.IsExpendable(p, -10)).To(BeTrue())
 	})
 })

@@ -139,6 +139,14 @@ func IsPreempting(pod *corev1.Pod) bool {
 	return pod.Status.NominatedNodeName != ""
 }
 
+// IsExpendable checks if a pod's priority is strictly below the configured cutoff. Karpenter does not provision
+// capacity for expendable pods, and does not require them to be rescheduled during disruption. A pod with no priority
+// is never expendable, and a cutoff of math.MinInt32 (the default) makes no pod expendable. The pod's preemptionPolicy
+// is deliberately not consulted: it governs whether the pod may preempt others, not whether it may be preempted.
+func IsExpendable(pod *corev1.Pod, cutoff int32) bool {
+	return pod.Spec.Priority != nil && *pod.Spec.Priority < cutoff
+}
+
 func IsPending(pod *corev1.Pod) bool {
 	return pod.Status.Phase == corev1.PodPending
 }
