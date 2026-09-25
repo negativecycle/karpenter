@@ -250,6 +250,9 @@ type PodData struct {
 	// in which case the pod is deferred to a subsequent scheduling loop.
 	ResourceClaims   []*resourcev1.ResourceClaim
 	ResourceClaimErr error
+
+	// CanPreemptExpendable is whether the pod may use the room that expendable pods hold on existing nodes
+	CanPreemptExpendable bool
 }
 
 type Scheduler struct {
@@ -285,6 +288,9 @@ type Scheduler struct {
 	instanceTypes map[string][]*cloudprovider.InstanceType
 	// cachedResourceClaims memoizes ResourceClaim lookups for the duration of a single scheduling loop.
 	cachedResourceClaims map[types.NamespacedName]*resourcev1.ResourceClaim
+	// cachedBufferPreemption memoizes, per PriorityClass name, whether CapacityBuffer virtual pods can preempt expendable
+	// pods for the duration of a single scheduling loop.
+	cachedBufferPreemption map[string]bool
 }
 
 // DRAError indicates a pod will not be attempted to be scheduled because it has Dynamic Resource Allocation requirements
@@ -599,6 +605,7 @@ func (s *Scheduler) updateCachedPodData(ctx context.Context, p *corev1.Pod) {
 		StrictRequirements:       strictRequirements,
 		HasResourceClaimRequests: pod.HasDRARequirements(p),
 		VolumeRequirements:       s.volumeReqsByPod[p.UID], // Volume requirements
+		CanPreemptExpendable:     s.canPreemptExpendable(ctx, p),
 	}
 	// Resolve the pod's ResourceClaims once, in the sequential path, so the parallel candidate evaluation can reuse them
 	// without per-candidate API lookups. A resolution failure is recorded and surfaced as a scheduling error in add().

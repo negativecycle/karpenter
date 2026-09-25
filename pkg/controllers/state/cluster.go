@@ -707,16 +707,17 @@ func (c *Cluster) newStateFromNodeClaim(nodeClaim *v1.NodeClaim, oldNode *StateN
 		oldNode = NewNode()
 	}
 	n := &StateNode{
-		Node:              oldNode.Node,
-		NodeClaim:         nodeClaim,
-		daemonSetRequests: oldNode.daemonSetRequests,
-		daemonSetLimits:   oldNode.daemonSetLimits,
-		podRequests:       oldNode.podRequests,
-		podLimits:         oldNode.podLimits,
-		hostPortUsage:     oldNode.hostPortUsage,
-		volumeUsage:       oldNode.volumeUsage,
-		markedForDeletion: oldNode.markedForDeletion,
-		nominatedUntil:    oldNode.nominatedUntil,
+		Node:                  oldNode.Node,
+		NodeClaim:             nodeClaim,
+		daemonSetRequests:     oldNode.daemonSetRequests,
+		daemonSetLimits:       oldNode.daemonSetLimits,
+		podRequests:           oldNode.podRequests,
+		podLimits:             oldNode.podLimits,
+		expendablePodRequests: oldNode.expendablePodRequests,
+		hostPortUsage:         oldNode.hostPortUsage,
+		volumeUsage:           oldNode.volumeUsage,
+		markedForDeletion:     oldNode.markedForDeletion,
+		nominatedUntil:        oldNode.nominatedUntil,
 	}
 	// Cleanup the old nodeClaim with its old providerID if its providerID changes
 	// This can happen since nodes don't get created with providerIDs. Rather, CCM picks up the
@@ -755,16 +756,17 @@ func (c *Cluster) newStateFromNode(ctx context.Context, node *corev1.Node, oldNo
 		oldNode = NewNode()
 	}
 	n := &StateNode{
-		Node:              node,
-		NodeClaim:         oldNode.NodeClaim,
-		daemonSetRequests: map[types.NamespacedName]corev1.ResourceList{},
-		daemonSetLimits:   map[types.NamespacedName]corev1.ResourceList{},
-		podRequests:       map[types.NamespacedName]corev1.ResourceList{},
-		podLimits:         map[types.NamespacedName]corev1.ResourceList{},
-		hostPortUsage:     scheduling.NewHostPortUsage(),
-		volumeUsage:       scheduling.NewVolumeUsage(),
-		markedForDeletion: oldNode.markedForDeletion,
-		nominatedUntil:    oldNode.nominatedUntil,
+		Node:                  node,
+		NodeClaim:             oldNode.NodeClaim,
+		daemonSetRequests:     map[types.NamespacedName]corev1.ResourceList{},
+		daemonSetLimits:       map[types.NamespacedName]corev1.ResourceList{},
+		podRequests:           map[types.NamespacedName]corev1.ResourceList{},
+		podLimits:             map[types.NamespacedName]corev1.ResourceList{},
+		expendablePodRequests: map[types.NamespacedName]corev1.ResourceList{},
+		hostPortUsage:         scheduling.NewHostPortUsage(),
+		volumeUsage:           scheduling.NewVolumeUsage(),
+		markedForDeletion:     oldNode.markedForDeletion,
+		nominatedUntil:        oldNode.nominatedUntil,
 	}
 	if err := multierr.Combine(
 		c.populateResourceRequests(ctx, n),

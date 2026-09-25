@@ -29,6 +29,7 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	schedulingv1 "k8s.io/api/scheduling/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1051,6 +1052,93 @@ var _ = Describe("Node Resource Level", func() {
 
 		ExpectStateNodeCount("==", 1)
 		ExpectStateNodeExists(cluster, node)
+	})
+})
+
+var _ = Describe("Expendable Pod Requests", func() {
+	var node *corev1.Node
+	var expendablePriority *schedulingv1.PriorityClass
+	cpuPod := func(cpu string, opts ...test.PodOptions) *corev1.Pod {
+		return test.Pod(append([]test.PodOptions{{
+			NodeName: node.Name,
+			ResourceRequirements: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(cpu)},
+			},
+		}}, opts...)...)
+	}
+
+	BeforeEach(func() {
+		ctx = options.ToContext(ctx, test.Options(test.OptionsFields{ExpendablePodsPriorityCutoff: lo.ToPtr[int32](-10)}))
+		expendablePriority = &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: test.RandomName()}, Value: -100}
+		node = test.Node(test.NodeOptions{
+			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+				v1.NodePoolLabelKey:            nodePool.Name,
+				corev1.LabelInstanceTypeStable: cloudProvider.InstanceTypes[0].Name,
+			}},
+			Allocatable: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
+			ProviderID:  test.RandomProviderID(),
+		})
+		ExpectApplied(ctx, env.Client, expendablePriority, node)
+		ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
+	})
+	AfterEach(func() {
+		ExpectDeleted(ctx, env.Client, expendablePriority)
+	})
+	It("should track the requests of expendable pods separately", func() {
+		pod := cpuPod("1")
+		expendablePod := cpuPod("1.5", test.PodOptions{PriorityClassName: expendablePriority.Name})
+		ExpectApplied(ctx, env.Client, pod, expendablePod)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(pod))
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(expendablePod))
+
+		stateNode := ExpectStateNodeExists(cluster, node)
+		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2.5")}, stateNode.PodRequests())
+		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1.5"), corev1.ResourcePods: resource.MustParse("1")}, stateNode.ExpendablePodRequests())
+
+		ExpectDeleted(ctx, env.Client, expendablePod)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(expendablePod))
+		Expect(ExpectStateNodeExists(cluster, node).ExpendablePodRequests()).To(BeEmpty())
+	})
+	It("should keep tracking the requests of expendable pods when the node's NodeClaim changes", func() {
+		nodeClaim := test.NodeClaim(v1.NodeClaim{Status: v1.NodeClaimStatus{ProviderID: node.Spec.ProviderID}})
+		ExpectApplied(ctx, env.Client, nodeClaim)
+		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+		expendablePod := cpuPod("1.5", test.PodOptions{PriorityClassName: expendablePriority.Name})
+		ExpectApplied(ctx, env.Client, expendablePod)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(expendablePod))
+
+		nodeClaim.Labels = lo.Assign(nodeClaim.Labels, map[string]string{"example.com/changed": "true"})
+		ExpectApplied(ctx, env.Client, nodeClaim)
+		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+
+		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1.5")}, ExpectStateNodeExists(cluster, node).ExpendablePodRequests())
+	})
+	It("should not track the requests of expendable DaemonSet pods", func() {
+		daemonSet := test.DaemonSet()
+		ExpectApplied(ctx, env.Client, daemonSet)
+		daemonPod := cpuPod("1", test.PodOptions{
+			PriorityClassName: expendablePriority.Name,
+			ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{
+				APIVersion:         "apps/v1",
+				Kind:               "DaemonSet",
+				Name:               daemonSet.Name,
+				UID:                daemonSet.UID,
+				Controller:         lo.ToPtr(true),
+				BlockOwnerDeletion: lo.ToPtr(true),
+			}}},
+		})
+		ExpectApplied(ctx, env.Client, daemonPod)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(daemonPod))
+
+		Expect(ExpectStateNodeExists(cluster, node).ExpendablePodRequests()).To(BeEmpty())
+	})
+	It("should not track any pods when the cutoff is unset", func() {
+		ctx = options.ToContext(ctx, test.Options())
+		pod := cpuPod("1", test.PodOptions{PriorityClassName: expendablePriority.Name})
+		ExpectApplied(ctx, env.Client, pod)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(pod))
+
+		Expect(ExpectStateNodeExists(cluster, node).ExpendablePodRequests()).To(BeEmpty())
 	})
 })
 

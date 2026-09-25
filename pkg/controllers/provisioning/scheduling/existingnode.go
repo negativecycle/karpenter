@@ -21,6 +21,7 @@ import (
 	"fmt"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
@@ -34,9 +35,12 @@ type ExistingNode struct {
 	cachedAvailable v1.ResourceList // Cache so we don't have to re-subtract resources on the StateNode every time
 	cachedTaints    []v1.Taint      // Cache so we don't hae to re-construct the taints each time we attempt to schedule a pod
 
-	Pods                    []*v1.Pod
-	topology                *Topology
-	remainingResources      v1.ResourceList
+	Pods               []*v1.Pod
+	topology           *Topology
+	remainingResources v1.ResourceList
+	// expendableResources is the room held by expendable pods on the node. It isn't part of remainingResources, and
+	// only pods that can preempt expendable pods may use it.
+	expendableResources     v1.ResourceList
 	requirements            scheduling.Requirements
 	isUnderConsolidateAfter bool
 	// instanceType is the resolved cloud provider instance type backing the node, used to source DRA template devices
@@ -69,6 +73,7 @@ func NewExistingNode(n *state.StateNode, topology *Topology, taints []v1.Taint, 
 		cachedTaints:            taints,
 		topology:                topology,
 		remainingResources:      resources.Subtract(available, daemonResources),
+		expendableResources:     n.ExpendablePodRequests(),
 		requirements:            scheduling.NewLabelRequirements(n.Labels()),
 		isUnderConsolidateAfter: isUnderConsolidateAfter,
 		instanceType:            instanceType,
@@ -98,7 +103,7 @@ func (n *ExistingNode) CanAdd(ctx context.Context, pod *v1.Pod, podData *PodData
 	}
 	// check resource requests first since that's a pretty likely reason the pod won't schedule on an in-flight
 	// node, which at this point can't be increased in size
-	if !resources.Fits(podData.Requests, n.remainingResources) {
+	if !n.fits(podData) {
 		return nil, nil, fmt.Errorf("exceeds node resources")
 	}
 	// Check NodeClaim Affinity Requirements
@@ -143,6 +148,16 @@ func (n *ExistingNode) CanAdd(ctx context.Context, pod *v1.Pod, podData *PodData
 	return nil, nil, lastErr
 }
 
+// fits returns whether the pod's requests fit in the node's free room or, if the pod can preempt expendable pods, in its
+// free room together with the room they hold
+func (n *ExistingNode) fits(podData *PodData) bool {
+	if resources.Fits(podData.Requests, n.remainingResources) {
+		return true
+	}
+	return podData.CanPreemptExpendable && len(n.expendableResources) != 0 &&
+		resources.Fits(podData.Requests, resources.Merge(n.remainingResources, n.expendableResources))
+}
+
 // tryVolumeAlternative attempts to add a pod with a specific set of volume requirements,
 // checking topology compatibility against the existing node.
 func (n *ExistingNode) tryVolumeAlternative(pod *v1.Pod, podData *PodData, baseRequirements scheduling.Requirements, volReqs scheduling.Requirements) (scheduling.Requirements, error) {
@@ -178,6 +193,19 @@ func (n *ExistingNode) Add(ctx context.Context, pod *v1.Pod, podData *PodData, n
 	// Update node
 	n.Pods = append(n.Pods, pod)
 	resources.SubtractFrom(n.remainingResources, podData.Requests)
+	// A pod that doesn't fit in the free room preempts expendable pods for the rest, so take the shortfall from their room
+	if podData.CanPreemptExpendable {
+		for name, quantity := range n.remainingResources {
+			if quantity.Sign() >= 0 {
+				continue
+			}
+			if expendable, ok := n.expendableResources[name]; ok {
+				expendable.Add(quantity)
+				n.expendableResources[name] = expendable
+				n.remainingResources[name] = resource.Quantity{Format: quantity.Format}
+			}
+		}
+	}
 	n.requirements = nodeRequirements
 	n.topology.Record(pod, n.cachedTaints, nodeRequirements)
 	n.HostPortUsage().Add(pod, scheduling.GetHostPorts(pod))

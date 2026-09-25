@@ -162,6 +162,9 @@ type StateNode struct {
 	podRequests        map[types.NamespacedName]corev1.ResourceList
 	podLimits          map[types.NamespacedName]corev1.ResourceList
 	podDisruptionCosts map[types.NamespacedName]float64
+	// expendablePodRequests is the subset of podRequests held by expendable pods, excluding DaemonSet pods. The
+	// kube-scheduler can preempt these pods to make room for pods that Karpenter moves off disrupted nodes.
+	expendablePodRequests map[types.NamespacedName]corev1.ResourceList
 
 	hostPortUsage *scheduling.HostPortUsage
 	volumeUsage   *scheduling.VolumeUsage
@@ -174,29 +177,31 @@ type StateNode struct {
 
 func NewNode() *StateNode {
 	return &StateNode{
-		daemonSetRequests:  map[types.NamespacedName]corev1.ResourceList{},
-		daemonSetLimits:    map[types.NamespacedName]corev1.ResourceList{},
-		podRequests:        map[types.NamespacedName]corev1.ResourceList{},
-		podLimits:          map[types.NamespacedName]corev1.ResourceList{},
-		podDisruptionCosts: map[types.NamespacedName]float64{},
-		hostPortUsage:      scheduling.NewHostPortUsage(),
-		volumeUsage:        scheduling.NewVolumeUsage(),
+		daemonSetRequests:     map[types.NamespacedName]corev1.ResourceList{},
+		daemonSetLimits:       map[types.NamespacedName]corev1.ResourceList{},
+		podRequests:           map[types.NamespacedName]corev1.ResourceList{},
+		podLimits:             map[types.NamespacedName]corev1.ResourceList{},
+		podDisruptionCosts:    map[types.NamespacedName]float64{},
+		expendablePodRequests: map[types.NamespacedName]corev1.ResourceList{},
+		hostPortUsage:         scheduling.NewHostPortUsage(),
+		volumeUsage:           scheduling.NewVolumeUsage(),
 	}
 }
 
 func (in *StateNode) ShallowCopy() *StateNode {
 	return &StateNode{
-		Node:               in.Node,
-		NodeClaim:          in.NodeClaim,
-		daemonSetRequests:  in.daemonSetRequests,
-		daemonSetLimits:    in.daemonSetLimits,
-		podRequests:        in.podRequests,
-		podLimits:          in.podLimits,
-		podDisruptionCosts: in.podDisruptionCosts,
-		hostPortUsage:      in.hostPortUsage,
-		volumeUsage:        in.volumeUsage,
-		markedForDeletion:  in.markedForDeletion,
-		nominatedUntil:     in.nominatedUntil,
+		Node:                  in.Node,
+		NodeClaim:             in.NodeClaim,
+		daemonSetRequests:     in.daemonSetRequests,
+		daemonSetLimits:       in.daemonSetLimits,
+		podRequests:           in.podRequests,
+		podLimits:             in.podLimits,
+		podDisruptionCosts:    in.podDisruptionCosts,
+		expendablePodRequests: in.expendablePodRequests,
+		hostPortUsage:         in.hostPortUsage,
+		volumeUsage:           in.volumeUsage,
+		markedForDeletion:     in.markedForDeletion,
+		nominatedUntil:        in.nominatedUntil,
 	}
 }
 
@@ -451,6 +456,11 @@ func (in *StateNode) PodLimits() corev1.ResourceList {
 	return resources.Merge(lo.Values(in.podLimits)...)
 }
 
+// ExpendablePodRequests is the total requested by the node's expendable pods, which are included in PodRequests
+func (in *StateNode) ExpendablePodRequests() corev1.ResourceList {
+	return resources.Merge(lo.Values(in.expendablePodRequests)...)
+}
+
 // DisruptionCost returns the exact disruption cost for this node:
 // PerNodeBaseDisruptionCost (1.0) + sum of positive per-pod eviction costs.
 // This is maintained incrementally as pods are added/removed.
@@ -500,6 +510,11 @@ func (in *StateNode) updateForPod(ctx context.Context, kubeClient client.Client,
 	if podutils.IsOwnedByDaemonSet(pod) {
 		in.daemonSetRequests[podKey] = resources.RequestsForPods(pod)
 		in.daemonSetLimits[podKey] = resources.LimitsForPods(pod)
+	} else if podutils.IsExpendable(pod, options.FromContext(ctx).ExpendablePodsPriorityCutoff) {
+		if in.expendablePodRequests == nil {
+			in.expendablePodRequests = map[types.NamespacedName]corev1.ResourceList{}
+		}
+		in.expendablePodRequests[podKey] = resources.RequestsForPods(pod)
 	}
 	// Maintain per-pod disruption cost for balanced scoring. Only non-daemon
 	// pods with positive eviction cost contribute to the node's disruption cost.
@@ -526,6 +541,7 @@ func (in *StateNode) cleanupForPod(podKey types.NamespacedName) {
 	delete(in.daemonSetRequests, podKey)
 	delete(in.daemonSetLimits, podKey)
 	delete(in.podDisruptionCosts, podKey)
+	delete(in.expendablePodRequests, podKey)
 }
 
 func nominationWindow(ctx context.Context) time.Duration {

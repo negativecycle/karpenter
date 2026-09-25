@@ -120,6 +120,24 @@ func (in *StateNode) DeepCopyInto(out *StateNode) {
 			(*out)[key] = val
 		}
 	}
+	if in.expendablePodRequests != nil {
+		in, out := &in.expendablePodRequests, &out.expendablePodRequests
+		*out = make(map[types.NamespacedName]v1.ResourceList, len(*in))
+		for key, val := range *in {
+			var outVal map[v1.ResourceName]resource.Quantity
+			if val == nil {
+				(*out)[key] = nil
+			} else {
+				inVal := (*in)[key]
+				in, out := &inVal, &outVal
+				*out = make(v1.ResourceList, len(*in))
+				for key, val := range *in {
+					(*out)[key] = val.DeepCopy()
+				}
+			}
+			(*out)[key] = outVal
+		}
+	}
 	if in.hostPortUsage != nil {
 		in, out := &in.hostPortUsage, &out.hostPortUsage
 		*out = new(scheduling.HostPortUsage)

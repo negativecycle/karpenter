@@ -5476,5 +5476,59 @@ var _ = Describe("Consolidation", func() {
 			Expect(blockedEventMessages()).To(ContainElement(And(ContainSubstring("prevents pod evictions"), ContainSubstring(pdb.Name))))
 			ExpectExists(ctx, env.Client, nodeClaims[0])
 		})
+		Context("when an expendable pod holds the only room elsewhere", func() {
+			// consolidateOntoExpendablePod binds pod to nodes[1] and a 30 CPU expendable pod to nodes[0], which has 32 CPU
+			// allocatable. pod only fits on nodes[0] if it can preempt the expendable pod.
+			consolidateOntoExpendablePod := func(pod *corev1.Pod) {
+				GinkgoHelper()
+				useFirstNodeForCapacityOnly()
+				expendablePod := test.Pod(test.PodOptions{
+					PriorityClassName: priorityClass.Name,
+					ResourceRequirements: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("30")},
+					},
+				})
+				ExpectApplied(ctx, env.Client, nodePool, pod, expendablePod, nodeClaims[0], nodes[0], nodeClaims[1], nodes[1])
+				ExpectManualBinding(ctx, env.Client, expendablePod, nodes[0])
+				ExpectManualBinding(ctx, env.Client, pod, nodes[1])
+
+				// inform cluster state about nodes and nodeclaims
+				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{nodes[0], nodes[1]}, []*v1.NodeClaim{nodeClaims[0], nodeClaims[1]})
+				ExpectSingletonReconciled(ctx, disruptionController)
+			}
+			podRequestingCPU := func(priorityClassName string) *corev1.Pod {
+				return test.Pod(test.PodOptions{
+					PriorityClassName: priorityClassName,
+					ResourceRequirements: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("16")},
+					},
+				})
+			}
+
+			It("should delete a node whose pods can preempt the expendable pod", func() {
+				// Once evicted, the pod preempts the expendable pod on nodes[0], so nodes[1] needs no replacement
+				consolidateOntoExpendablePod(podRequestingCPU(""))
+
+				cmds := queue.GetCommands()
+				Expect(cmds).To(HaveLen(1))
+				Expect(cmds[0].Decision()).To(Equal(disruption.DeleteDecision))
+				Expect(cmds[0].Candidates).To(ConsistOf(HaveField("NodeClaim.Name", nodeClaims[1].Name)))
+			})
+			It("should not delete a node whose pods cannot preempt the expendable pod", func() {
+				// With preemptionPolicy Never the pod would stay pending once evicted, and Karpenter would provision a node
+				// for it, so deleting nodes[1] would only lead to relaunching it
+				nonPreemptingClass := &schedulingv1.PriorityClass{
+					ObjectMeta:       metav1.ObjectMeta{Name: test.RandomName()},
+					Value:            0,
+					PreemptionPolicy: new(corev1.PreemptNever),
+				}
+				ExpectApplied(ctx, env.Client, nonPreemptingClass)
+				DeferCleanup(func() { ExpectDeleted(ctx, env.Client, nonPreemptingClass) })
+				consolidateOntoExpendablePod(podRequestingCPU(nonPreemptingClass.Name))
+
+				Expect(queue.GetCommands()).To(BeEmpty())
+				ExpectExists(ctx, env.Client, nodeClaims[1])
+			})
+		})
 	})
 })

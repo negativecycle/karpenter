@@ -3598,8 +3598,112 @@ var _ = Describe("Provisioning", func() {
 			Expect(cloudProvider.CreateCalls[0].Spec.Resources.Requests.Memory().Cmp(resource.MustParse("200M"))).To(Equal(0))
 			ExpectMetricGaugeValue(pscheduling.PendingExpendablePodCount, 2, nil)
 		})
+		Context("Preempting Expendable Pods", func() {
+			// nodeWith2Gi creates an unmanaged node with 2Gi of memory
+			nodeWith2Gi := func() *corev1.Node {
+				GinkgoHelper()
+				node := test.Node(test.NodeOptions{
+					ProviderID: test.RandomProviderID(),
+					Allocatable: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("4"),
+						corev1.ResourceMemory: resource.MustParse("2Gi"),
+						corev1.ResourcePods:   resource.MustParse("10"),
+					},
+				})
+				ExpectApplied(ctx, env.Client, nodePool, node)
+				// The API server taints new nodes not-ready, which the node lifecycle controller would remove for a Ready node
+				node.Spec.Taints = nil
+				ExpectApplied(ctx, env.Client, node)
+				ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
+				return node
+			}
+			// nodeWithExpendablePod creates a node with 2Gi of memory, 1.5Gi of it held by a bound expendable pod
+			nodeWithExpendablePod := func() *corev1.Node {
+				GinkgoHelper()
+				node := nodeWith2Gi()
+				bindPod(test.Pod(test.PodOptions{PriorityClassName: lowPriority.Name}, memoryRequest("1.5Gi")), node)
+				Expect(ExpectStateNodeExists(cluster, node).ExpendablePodRequests()).To(HaveKey(corev1.ResourceMemory))
+				return node
+			}
+
+			It("should provision capacity for a pending pod that only fits in the room held by expendable pods", func() {
+				// The kube-scheduler has already declined to preempt for a pending pod that reaches Karpenter
+				node := nodeWithExpendablePod()
+				pod := test.UnschedulablePod(memoryRequest("1Gi"))
+				ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+				Expect(ExpectScheduled(ctx, env.Client, pod).Name).ToNot(Equal(node.Name))
+				Expect(cloudProvider.CreateCalls).To(HaveLen(1))
+			})
+			It("should reschedule a deleting node's pod into the room held by expendable pods", func() {
+				nodeWithExpendablePod()
+				deletingNode := nodeWith2Gi()
+				bindPod(test.Pod(memoryRequest("1Gi")), deletingNode)
+
+				cluster.MarkForDeletion(deletingNode.Spec.ProviderID)
+				ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov)
+				Expect(cloudProvider.CreateCalls).To(BeEmpty())
+			})
+			It("should not reschedule a deleting node's pod into the room held by expendable pods if it can't preempt", func() {
+				neverPriority := &schedulingv1.PriorityClass{
+					ObjectMeta:       metav1.ObjectMeta{Name: test.RandomName()},
+					PreemptionPolicy: lo.ToPtr(corev1.PreemptNever),
+				}
+				ExpectApplied(ctx, env.Client, neverPriority)
+				DeferCleanup(func() { ExpectDeleted(ctx, env.Client, neverPriority) })
+				nodeWithExpendablePod()
+				deletingNode := nodeWith2Gi()
+				bindPod(test.Pod(test.PodOptions{PriorityClassName: neverPriority.Name}, memoryRequest("1Gi")), deletingNode)
+
+				cluster.MarkForDeletion(deletingNode.Spec.ProviderID)
+				ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov)
+				Expect(cloudProvider.CreateCalls).To(HaveLen(1))
+			})
+			DescribeTable("should count the room held by expendable pods as CapacityBuffer headroom only if the buffer's pods can preempt them",
+				func(priorityClass func() string, expectedNodeClaims int) {
+					ctx = options.ToContext(ctx, test.Options(test.OptionsFields{
+						ExpendablePodsPriorityCutoff: lo.ToPtr[int32](-10),
+						FeatureGates:                 test.FeatureGates{CapacityBuffer: lo.ToPtr(true)},
+					}))
+					nodeWithExpendablePod()
+					virtualPodCache := virtualpods.NewVirtualPodCache(env.Client)
+					// Hydrate the cache from the (empty) cluster first so that it doesn't overwrite the entry below
+					Expect(virtualPodCache.GetAll(ctx)).To(BeEmpty())
+					virtualPodCache.UpdateEntry(test.ReadyBuffer("web", 1), corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+						PriorityClassName: priorityClass(),
+						Containers: []corev1.Container{{Name: "web", Image: "web", Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
+						}}},
+					}})
+					bufferProv := provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, deviceallocation.NewController(env.Client), virtualPodCache)
+
+					ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, bufferProv)
+					Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(expectedNodeClaims))
+				},
+				Entry("without a PriorityClass", func() string { return "" }, 0),
+				Entry("with a PriorityClass at the cutoff", func() string { return cutoffPriority.Name }, 0),
+				Entry("with an expendable PriorityClass", func() string { return lowPriority.Name }, 1),
+				Entry("with a PriorityClass that doesn't exist", func() string { return "does-not-exist" }, 1),
+				Entry("with a PriorityClass that never preempts", func() string {
+					neverPriority := &schedulingv1.PriorityClass{
+						ObjectMeta:       metav1.ObjectMeta{Name: test.RandomName()},
+						PreemptionPolicy: lo.ToPtr(corev1.PreemptNever),
+					}
+					ExpectApplied(ctx, env.Client, neverPriority)
+					DeferCleanup(func() { ExpectDeleted(ctx, env.Client, neverPriority) })
+					return neverPriority.Name
+				}, 1),
+			)
+		})
 	})
 })
+
+// bindPod creates a pod bound to the node and tracks it in cluster state
+func bindPod(pod *corev1.Pod, node *corev1.Node) {
+	GinkgoHelper()
+	pod.Spec.NodeName = node.Name
+	ExpectApplied(ctx, env.Client, pod)
+	Expect(cluster.UpdatePod(ctx, pod)).To(Succeed())
+}
 
 func ExpectNodeClaimRequirements(nodeClaim *v1.NodeClaim, requirements ...corev1.NodeSelectorRequirement) {
 	GinkgoHelper()

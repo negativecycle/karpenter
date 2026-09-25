@@ -319,3 +319,20 @@ var _ = Describe("IsExpendable", func() {
 		Expect(pod.IsExpendable(p, -10)).To(BeTrue())
 	})
 })
+
+var _ = Describe("CanPreemptExpendable", func() {
+	DescribeTable("should require a priority at or above the cutoff and a preemptionPolicy other than Never",
+		func(priority *int32, preemptionPolicy *corev1.PreemptionPolicy, cutoff int32, expected bool) {
+			p := &corev1.Pod{Spec: corev1.PodSpec{Priority: priority, PreemptionPolicy: preemptionPolicy}}
+			Expect(pod.CanPreemptExpendable(p, cutoff)).To(Equal(expected))
+		},
+		Entry("equal to the cutoff", new(int32(-10)), nil, int32(-10), true),
+		Entry("above the cutoff", new(int32(0)), nil, int32(-10), true),
+		Entry("below the cutoff", new(int32(-100)), nil, int32(-10), false),
+		Entry("above the cutoff with preemptionPolicy PreemptLowerPriority", new(int32(0)), new(corev1.PreemptLowerPriority), int32(-10), true),
+		Entry("above the cutoff with preemptionPolicy Never", new(int32(0)), new(corev1.PreemptNever), int32(-10), false),
+		Entry("no priority with a negative cutoff", nil, nil, int32(-10), true),
+		// Without a priority, the pod is priority 0 and doesn't outrank expendable pods between 0 and the cutoff
+		Entry("no priority with a positive cutoff", nil, nil, int32(10), false),
+	)
+})

@@ -53,6 +53,9 @@ rules:
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["scheduling.k8s.io"]
+    resources: ["priorityclasses"]
+    verbs: ["get", "list", "watch"]
   # Write
   - apiGroups: ["karpenter.sh"]
     resources: ["nodeclaims", "nodeclaims/status", "nodeclaims/finalizers"]

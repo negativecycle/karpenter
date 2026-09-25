@@ -17,6 +17,7 @@ limitations under the License.
 package integration_test
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -32,8 +33,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/karpenter/kwok/apis/v1alpha1"
+	autoscalingv1beta1 "sigs.k8s.io/karpenter/pkg/apis/autoscaling/v1beta1"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/test"
+	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
 
 // expendableCutoffEnv is the setting under test. Pods whose priority is
@@ -74,6 +77,59 @@ var _ = Describe("ExpendablePods", func() {
 			})
 		}
 	})
+
+	// launchCandidateNode launches two nodes. The first runs an anchor pod, whose do-not-disrupt annotation stops
+	// consolidation from choosing that node, and two blocker pods that fill it. The second is launched for the mover
+	// pod, since the first is full, and is the node consolidation can remove. It returns the second node's NodeClaim
+	// and the blocker deployment, whose deletion frees two 1-CPU slots on the first node.
+	launchCandidateNode := func(mover *appsv1.Deployment, objects ...client.Object) (*v1.NodeClaim, *appsv1.Deployment) {
+		GinkgoHelper()
+		anchor := expendableTestDeployment("anchor", "", 1, map[string]string{v1.DoNotDisruptAnnotationKey: "true"})
+		blocker := expendableTestDeployment("blocker", "", 2, nil)
+		env.ExpectCreated(append([]client.Object{nodeClass, nodePool, expendable, anchor, blocker}, objects...)...)
+		first := env.EventuallyExpectCreatedNodeClaimCount("==", 1)[0]
+		env.EventuallyExpectHealthyPodCount(expendableTestSelector(anchor), 1)
+		env.EventuallyExpectHealthyPodCount(expendableTestSelector(blocker), 2)
+
+		env.ExpectCreated(mover)
+		nodeClaims := env.EventuallyExpectCreatedNodeClaimCount("==", 2)
+		env.EventuallyExpectHealthyPodCount(expendableTestSelector(mover), 1)
+		second, _ := lo.Find(nodeClaims, func(nc *v1.NodeClaim) bool { return nc.Name != first.Name })
+		return second, blocker
+	}
+	// launchCandidateNodeBesideBackfill launches the nodes of launchCandidateNode with two expendable pods on the
+	// candidate beside the mover, then frees two 1-CPU slots on the first node
+	launchCandidateNodeBesideBackfill := func(mover *appsv1.Deployment) (*v1.NodeClaim, *appsv1.Deployment) {
+		GinkgoHelper()
+		candidate, blocker := launchCandidateNode(mover)
+		// The first node is full, so the backfill runs beside the mover
+		backfill := expendableTestDeployment("backfill", expendable.Name, 2, nil)
+		env.ExpectCreated(backfill)
+		env.EventuallyExpectHealthyPodCount(expendableTestSelector(backfill), 2)
+		env.ExpectDeleted(blocker)
+		eventuallyExpectNoPods(expendableTestSelector(blocker))
+		return candidate, backfill
+	}
+	// enableConsolidation lets consolidation act on the NodePool once a spec's pods are in place
+	enableConsolidation := func() {
+		GinkgoHelper()
+		nodePool.Spec.Disruption.ConsolidateAfter = v1.MustParseNillableDuration("0s")
+		env.ExpectUpdated(nodePool)
+	}
+	// launchChurningNode launches a node for a pod with do-not-disrupt, so the node stays once it is Consolidatable, and
+	// starts deleting the expendable pod that runs beside it every 10 seconds, so its deployment keeps binding new ones.
+	// It returns the node's NodeClaim and a function that stops the churn.
+	launchChurningNode := func() (*v1.NodeClaim, func()) {
+		GinkgoHelper()
+		nodePool.Spec.Disruption.ConsolidateAfter = v1.MustParseNillableDuration("30s")
+		normal := expendableTestDeployment("normal", "", 1, map[string]string{v1.DoNotDisruptAnnotationKey: "true"})
+		backfill := expendableTestDeployment("backfill", expendable.Name, 1, nil)
+		env.ExpectCreated(nodeClass, nodePool, expendable, normal, backfill)
+		nodeClaim := env.EventuallyExpectCreatedNodeClaimCount("==", 1)[0]
+		env.EventuallyExpectHealthyPodCount(expendableTestSelector(normal), 1)
+		env.EventuallyExpectHealthyPodCount(expendableTestSelector(backfill), 1)
+		return nodeClaim, churnPods(expendableTestSelector(backfill), 10*time.Second)
+	}
 
 	// Ordered so the setting is changed (and Karpenter restarted) once for the
 	// group; ContinueOnFailure so one failing spec does not skip the rest.
@@ -180,6 +236,91 @@ var _ = Describe("ExpendablePods", func() {
 				env.EventuallyExpectConsolidatable(nodeClaim)
 				env.ConsistentlyExpectNoDisruptions(1, time.Minute)
 			})
+			It("should consolidate a node whose non-expendable pods fit elsewhere, without moving its expendable pods", func() {
+				mover := expendableTestDeployment("mover", "", 1, nil)
+				candidate, backfill := launchCandidateNodeBesideBackfill(mover)
+
+				enableConsolidation()
+				env.EventuallyExpectNotFoundAssertion(candidate).WithTimeout(3 * time.Minute).Should(Succeed())
+				env.EventuallyExpectHealthyPodCount(expendableTestSelector(mover), 1)
+				// The first node has room for the mover and one of the two expendable pods
+				eventuallyExpectBoundAndPending(expendableTestSelector(backfill), 1, 1)
+				env.ConsistentlyExpectNodeClaimCountNotExceed(time.Minute, 1)
+			})
+			Context("when expendable pods hold the only room elsewhere", func() {
+				// launchBackfilledNodes launches the nodes of launchCandidateNode and fills the two free 1-CPU slots on
+				// each with expendable pods, so the mover can only move by preempting one
+				launchBackfilledNodes := func(mover *appsv1.Deployment, objects ...client.Object) (*v1.NodeClaim, *appsv1.Deployment) {
+					GinkgoHelper()
+					candidate, blocker := launchCandidateNode(mover, objects...)
+					env.ExpectDeleted(blocker)
+					eventuallyExpectNoPods(expendableTestSelector(blocker))
+					backfill := expendableTestDeployment("backfill", expendable.Name, 4, nil)
+					env.ExpectCreated(backfill)
+					env.EventuallyExpectHealthyPodCount(expendableTestSelector(backfill), 4)
+					return candidate, backfill
+				}
+
+				It("should consolidate a node whose pods can preempt the expendable pods", func() {
+					mover := expendableTestDeployment("mover", "", 1, nil)
+					candidate, backfill := launchBackfilledNodes(mover)
+
+					enableConsolidation()
+					env.EventuallyExpectNotFoundAssertion(candidate).WithTimeout(3 * time.Minute).Should(Succeed())
+					// Once evicted, the mover preempts an expendable pod on the remaining node
+					env.EventuallyExpectHealthyPodCount(expendableTestSelector(mover), 1)
+					eventuallyExpectBoundAndPending(expendableTestSelector(backfill), 1, 3)
+					env.ConsistentlyExpectNodeClaimCountNotExceed(time.Minute, 1)
+				})
+				It("should not consolidate a node whose pods can't preempt the expendable pods", func() {
+					neverPreempt := &schedulingv1.PriorityClass{
+						ObjectMeta:       metav1.ObjectMeta{Name: fmt.Sprintf("never-preempt-%s", test.RandomName())},
+						PreemptionPolicy: lo.ToPtr(corev1.PreemptNever),
+					}
+					mover := expendableTestDeployment("mover", neverPreempt.Name, 1, nil)
+					candidate, _ := launchBackfilledNodes(mover, neverPreempt)
+
+					enableConsolidation()
+					env.EventuallyExpectConsolidatable(candidate)
+					env.ConsistentlyExpectNoDisruptions(2, time.Minute)
+				})
+			})
+			It("should not restart consolidateAfter when expendable pods churn on a node", func() {
+				nodeClaim, stopChurn := launchChurningNode()
+				defer stopChurn()
+
+				// Bounded: without the cutoff, the churn restarts the 30s timer indefinitely
+				Eventually(consolidatable(nodeClaim)).WithTimeout(2 * time.Minute).Should(BeTrue())
+			})
+		})
+
+		Context("CapacityBuffer", func() {
+			// launchBackfilledNode fills a node with a normal pod and two expendable pods
+			launchBackfilledNode := func() {
+				GinkgoHelper()
+				normal := expendableTestDeployment("normal", "", 1, nil)
+				backfill := expendableTestDeployment("backfill", expendable.Name, 2, nil)
+				env.ExpectCreated(nodeClass, nodePool, expendable, normal, backfill)
+				env.EventuallyExpectCreatedNodeClaimCount("==", 1)
+				env.EventuallyExpectHealthyPodCount(expendableTestSelector(normal), 1)
+				env.EventuallyExpectHealthyPodCount(expendableTestSelector(backfill), 2)
+			}
+
+			It("should count the room held by expendable pods as headroom for a buffer whose pods can preempt them", func() {
+				launchBackfilledNode()
+				template, buffer := expendableTestBuffer("")
+				env.ExpectCreated(template, buffer)
+
+				EventuallyExpectCapacityBufferProvisionedWithReason(env, env.Client, buffer, "FitsExistingCapacity")
+				env.ConsistentlyExpectNodeClaimCountNotExceed(time.Minute, 1)
+			})
+			It("should not count the room held by expendable pods as headroom for an expendable buffer", func() {
+				launchBackfilledNode()
+				template, buffer := expendableTestBuffer(expendable.Name)
+				env.ExpectCreated(template, buffer)
+
+				env.EventuallyExpectCreatedNodeClaimCount("==", 2)
+			})
 		})
 	})
 
@@ -215,6 +356,20 @@ var _ = Describe("ExpendablePods", func() {
 
 			env.EventuallyExpectConsolidatable(nodeClaim)
 			env.ConsistentlyExpectNoDisruptions(1, time.Minute)
+		})
+		It("should not consolidate a node whose low-priority pods don't fit elsewhere", func() {
+			mover := expendableTestDeployment("mover", "", 1, nil)
+			candidate, _ := launchCandidateNodeBesideBackfill(mover)
+
+			enableConsolidation()
+			env.EventuallyExpectConsolidatable(candidate)
+			env.ConsistentlyExpectNoDisruptions(2, time.Minute)
+		})
+		It("should restart consolidateAfter when low-priority pods churn on a node", func() {
+			nodeClaim, stopChurn := launchChurningNode()
+			defer stopChurn()
+
+			Consistently(consolidatable(nodeClaim)).WithTimeout(90 * time.Second).Should(BeFalse())
 		})
 	})
 })
@@ -253,4 +408,76 @@ func eventuallyExpectBoundAndPending(selector labels.Selector, minBound, minPend
 		g.Expect(bound).To(BeNumerically(">=", minBound))
 		g.Expect(len(pods.Items) - bound).To(BeNumerically(">=", minPending))
 	}).Should(Succeed())
+}
+
+// eventuallyExpectNoPods waits until none of the selected pods remain
+func eventuallyExpectNoPods(selector labels.Selector) {
+	GinkgoHelper()
+	Eventually(func(g Gomega) {
+		pods := &corev1.PodList{}
+		g.Expect(env.Client.List(env, pods, client.MatchingLabelsSelector{Selector: selector})).To(Succeed())
+		g.Expect(pods.Items).To(BeEmpty())
+	}).Should(Succeed())
+}
+
+// consolidatable returns a function for Eventually or Consistently that reports whether the NodeClaim is Consolidatable
+func consolidatable(nodeClaim *v1.NodeClaim) func(Gomega) bool {
+	return func(g Gomega) bool {
+		nc := &v1.NodeClaim{}
+		g.Expect(env.Client.Get(env, client.ObjectKeyFromObject(nodeClaim), nc)).To(Succeed())
+		return nc.StatusConditions().Get(v1.ConditionTypeConsolidatable).IsTrue()
+	}
+}
+
+// churnPods deletes one of the selected pods that is bound to a node at every interval, until the returned function is
+// called or the spec ends
+func churnPods(selector labels.Selector, interval time.Duration) func() {
+	ctx, cancel := context.WithCancel(env.Context)
+	DeferCleanup(cancel)
+	go func() {
+		defer GinkgoRecover()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			pods := &corev1.PodList{}
+			if err := env.Client.List(ctx, pods, client.MatchingLabelsSelector{Selector: selector}); err != nil {
+				continue
+			}
+			if pod, ok := lo.Find(pods.Items, func(p corev1.Pod) bool { return p.Spec.NodeName != "" && p.DeletionTimestamp.IsZero() }); ok {
+				// Errors are ignored: the next tick retries, and the pod may already be gone
+				_ = env.Client.Delete(ctx, &pod, client.GracePeriodSeconds(0))
+			}
+		}
+	}()
+	return cancel
+}
+
+// expendableTestBuffer builds a CapacityBuffer of one 1-CPU pod, and the PodTemplate it refers to. An empty
+// priorityClass leaves the buffer's pods at the cluster's default priority.
+func expendableTestBuffer(priorityClass string) (*corev1.PodTemplate, *autoscalingv1beta1.CapacityBuffer) {
+	template := &corev1.PodTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: test.RandomName(), Namespace: "default"},
+		Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			PriorityClassName: priorityClass,
+			Containers: []corev1.Container{{
+				Name:  "pause",
+				Image: "registry.k8s.io/pause:3.10",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+				},
+			}},
+		}},
+	}
+	buffer := test.CapacityBuffer(autoscalingv1beta1.CapacityBuffer{
+		Spec: autoscalingv1beta1.CapacityBufferSpec{
+			PodTemplateRef: &autoscalingv1beta1.LocalObjectRef{Name: template.Name},
+			Replicas:       lo.ToPtr(int32(1)),
+		},
+	})
+	return template, buffer
 }

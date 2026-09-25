@@ -22,6 +22,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/utils/clock"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -145,6 +146,16 @@ func IsPreempting(pod *corev1.Pod) bool {
 // is deliberately not consulted: it governs whether the pod may preempt others, not whether it may be preempted.
 func IsExpendable(pod *corev1.Pod, cutoff int32) bool {
 	return pod.Spec.Priority != nil && *pod.Spec.Priority < cutoff
+}
+
+// CanPreemptExpendable checks if the kube-scheduler may preempt expendable pods to make room for a pod: its
+// preemptionPolicy isn't Never, and its priority is at least the cutoff, so above every expendable pod's. Like the
+// kube-scheduler, it treats a pod with no priority as priority 0.
+func CanPreemptExpendable(pod *corev1.Pod, cutoff int32) bool {
+	if pod.Spec.PreemptionPolicy != nil && *pod.Spec.PreemptionPolicy == corev1.PreemptNever {
+		return false
+	}
+	return corev1helpers.PodPriority(pod) >= cutoff
 }
 
 func IsPending(pod *corev1.Pod) bool {
