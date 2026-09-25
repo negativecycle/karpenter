@@ -31,6 +31,7 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	schedulingv1 "k8s.io/api/scheduling/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -112,6 +113,7 @@ var _ = AfterEach(func() {
 	cloudProvider.Reset()
 	cluster.Reset()
 	pscheduling.IgnoredPodCount.Set(0, nil)
+	pscheduling.PendingExpendablePodCount.Set(0, nil)
 })
 
 var _ = Describe("Provisioning", func() {
@@ -3471,6 +3473,130 @@ var _ = Describe("Provisioning", func() {
 					})
 				})
 			})
+		})
+	})
+	Context("Expendable Pods", func() {
+		var nodePool *v1.NodePool
+		var lowPriority, cutoffPriority *schedulingv1.PriorityClass
+
+		// Pod priority is resolved from a PriorityClass by the Priority admission plugin, which rejects pods that
+		// set spec.priority directly
+		expendablePod := func(opts ...test.PodOptions) *corev1.Pod {
+			return test.UnschedulablePod(append([]test.PodOptions{{PriorityClassName: lowPriority.Name}}, opts...)...)
+		}
+		memoryRequest := func(quantity string) test.PodOptions {
+			return test.PodOptions{ResourceRequirements: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(quantity)},
+			}}
+		}
+
+		BeforeEach(func() {
+			nodePool = test.NodePool()
+			lowPriority = &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: test.RandomName()}, Value: -100}
+			cutoffPriority = &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: test.RandomName()}, Value: -10}
+			ExpectApplied(ctx, env.Client, lowPriority, cutoffPriority)
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{ExpendablePodsPriorityCutoff: lo.ToPtr[int32](-10)}))
+		})
+		AfterEach(func() {
+			ExpectDeleted(ctx, env.Client, lowPriority, cutoffPriority)
+		})
+		It("should not provision capacity for a pod below the cutoff", func() {
+			pod := expendablePod()
+			ExpectApplied(ctx, env.Client, nodePool)
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+			ExpectNotScheduled(ctx, env.Client, pod)
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(BeEmpty())
+			ExpectMetricGaugeValue(pscheduling.PendingExpendablePodCount, 1, nil)
+		})
+		It("should filter out an expendable pod before validating it", func() {
+			// An invalid pod that is also expendable must not be validated, since validation publishes events
+			pod := expendablePod(test.PodOptions{PersistentVolumeClaims: []string{"invalid"}})
+			ExpectApplied(ctx, env.Client, nodePool)
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+			ExpectNotScheduled(ctx, env.Client, pod)
+			ExpectMetricGaugeValue(pscheduling.IgnoredPodCount, 0, nil)
+			ExpectMetricGaugeValue(pscheduling.PendingExpendablePodCount, 1, nil)
+		})
+		It("should provision capacity for a pod at the cutoff", func() {
+			pod := test.UnschedulablePod(test.PodOptions{PriorityClassName: cutoffPriority.Name})
+			ExpectApplied(ctx, env.Client, nodePool)
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+			ExpectScheduled(ctx, env.Client, pod)
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
+		})
+		It("should provision capacity for a low priority pod when the cutoff is left at the default", func() {
+			ctx = options.ToContext(ctx, test.Options())
+			pod := expendablePod()
+			ExpectApplied(ctx, env.Client, nodePool)
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+			ExpectScheduled(ctx, env.Client, pod)
+			ExpectMetricGaugeValue(pscheduling.PendingExpendablePodCount, 0, nil)
+		})
+		It("should not requeue or ack an expendable pod", func() {
+			podController := provisioning.NewPodController(env.Client, prov, cluster)
+			pod := expendablePod()
+			normalPod := test.UnschedulablePod()
+			ExpectApplied(ctx, env.Client, pod, normalPod)
+
+			Expect(ExpectObjectReconciled(ctx, env.Client, podController, pod).RequeueAfter).To(BeZero())
+			Expect(cluster.PodAckTime(client.ObjectKeyFromObject(pod)).IsZero()).To(BeTrue())
+
+			Expect(ExpectObjectReconciled(ctx, env.Client, podController, normalPod).RequeueAfter).ToNot(BeZero())
+			Expect(cluster.PodAckTime(client.ObjectKeyFromObject(normalPod)).IsZero()).To(BeFalse())
+		})
+		It("should size replacement capacity for a deleting node without its expendable pods", func() {
+			pod := test.UnschedulablePod(memoryRequest("100M"))
+			ExpectApplied(ctx, env.Client, nodePool)
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+			node := ExpectScheduled(ctx, env.Client, pod)
+			ExpectApplied(ctx, env.Client, test.Pod(
+				test.PodOptions{NodeName: node.Name, PriorityClassName: lowPriority.Name},
+				memoryRequest("1Gi"),
+			))
+
+			cluster.MarkForDeletion(node.Spec.ProviderID)
+			cloudProvider.CreateCalls = nil
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov)
+
+			Expect(cloudProvider.CreateCalls).To(HaveLen(1))
+			Expect(cloudProvider.CreateCalls[0].Spec.Resources.Requests.Memory().Cmp(resource.MustParse("100M"))).To(Equal(0))
+		})
+		It("should provision capacity for a CapacityBuffer even though its virtual pods have the lowest priority", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{
+				ExpendablePodsPriorityCutoff: lo.ToPtr[int32](-10),
+				FeatureGates:                 test.FeatureGates{CapacityBuffer: lo.ToPtr(true)},
+			}))
+			virtualPodCache := virtualpods.NewVirtualPodCache(env.Client)
+			// Hydrate the cache from the (empty) cluster first so that it doesn't overwrite the entry below
+			Expect(virtualPodCache.GetAll(ctx)).To(BeEmpty())
+			virtualPodCache.UpdateEntry(test.ReadyBuffer("web", 1), corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "web", Image: "web", Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("100M")},
+				}}},
+			}})
+			bufferProv := provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, deviceallocation.NewController(env.Client), virtualPodCache)
+
+			ExpectApplied(ctx, env.Client, nodePool)
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, bufferProv)
+
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
+			ExpectMetricGaugeValue(pscheduling.PendingExpendablePodCount, 0, nil)
+		})
+		It("should size a NodeClaim for only the non-expendable pods in a batch", func() {
+			normalPods := []*corev1.Pod{test.UnschedulablePod(memoryRequest("100M")), test.UnschedulablePod(memoryRequest("100M"))}
+			expendablePods := []*corev1.Pod{expendablePod(memoryRequest("1Gi")), expendablePod(memoryRequest("1Gi"))}
+			ExpectApplied(ctx, env.Client, nodePool)
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, append(normalPods, expendablePods...)...)
+
+			for _, p := range normalPods {
+				ExpectScheduled(ctx, env.Client, p)
+			}
+			for _, p := range expendablePods {
+				ExpectNotScheduled(ctx, env.Client, p)
+			}
+			Expect(cloudProvider.CreateCalls).To(HaveLen(1))
+			Expect(cloudProvider.CreateCalls[0].Spec.Resources.Requests.Memory().Cmp(resource.MustParse("200M"))).To(Equal(0))
+			ExpectMetricGaugeValue(pscheduling.PendingExpendablePodCount, 2, nil)
 		})
 	})
 })

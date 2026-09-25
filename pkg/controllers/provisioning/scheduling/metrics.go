@@ -93,6 +93,17 @@ var (
 		[]opmetrics.Label{},
 		opmetrics.Alpha,
 	)
+	PendingExpendablePodCount = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry,
+		prometheus.GaugeOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: schedulerSubsystem,
+			Name:      "pending_expendable_pods_count",
+			Help:      "Number of pending pods below the expendable pods priority cutoff that Karpenter did not provision capacity for",
+		},
+		[]opmetrics.Label{},
+		opmetrics.Alpha,
+	)
 	UnschedulablePodsCount = opmetrics.NewPrometheusGauge(
 		crmetrics.Registry,
 		prometheus.GaugeOpts{

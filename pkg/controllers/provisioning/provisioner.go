@@ -200,6 +200,9 @@ func (p *Provisioner) GetPendingPods(ctx context.Context) ([]*corev1.Pod, error)
 	if err != nil {
 		return nil, fmt.Errorf("listing pods, %w", err)
 	}
+	// filter out expendable pods before validating so that we don't publish events for them
+	pods, expendablePods := FilterExpendable(ctx, pods)
+	p.reportExpendablePods(ctx, expendablePods)
 	rejectedPods, pods := lo.FilterReject(pods, func(po *corev1.Pod, _ int) bool {
 		if err := p.Validate(ctx, po); err != nil {
 			// Mark in memory that this pod is unschedulable
@@ -222,6 +225,22 @@ func (p *Provisioner) GetPendingPods(ctx context.Context) ([]*corev1.Pod, error)
 		pods = append(pods, p.virtualPodCache.GetAll(ctx)...)
 	}
 	return pods, nil
+}
+
+// reportExpendablePods records the number of pending expendable pods, and logs each one once at debug level
+func (p *Provisioner) reportExpendablePods(ctx context.Context, expendablePods []*corev1.Pod) {
+	scheduler.PendingExpendablePodCount.Set(float64(len(expendablePods)), nil)
+	// Consolidation simulations call GetPendingPods repeatedly, so only dedupe pods when the log would be written
+	if !log.FromContext(ctx).V(1).Enabled() {
+		return
+	}
+	expendablePodKeys := lo.FilterMap(expendablePods, func(po *corev1.Pod, _ int) (client.ObjectKey, bool) {
+		return client.ObjectKeyFromObject(po), p.cm.HasChanged(string(po.UID), "pod-expendable")
+	})
+	// We reduce the amount of logging that we do per-pod by grouping log lines like this together
+	if len(expendablePodKeys) > 0 {
+		log.FromContext(ctx).V(1).WithValues("pods", pretty.Slice(expendablePodKeys, 10)).Info("ignoring expendable pod(s)")
+	}
 }
 
 // consolidationWarnings potentially writes logs warning about possible unexpected interactions
@@ -388,6 +407,8 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 	if err != nil {
 		return scheduler.Results{}, err
 	}
+	// Don't size replacement capacity for expendable pods on deleting nodes
+	deletingNodePods, _ = FilterExpendable(ctx, deletingNodePods)
 
 	pods := append(pendingPods, deletingNodePods...)
 	// nothing to schedule, so just return success

@@ -31,6 +31,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	"sigs.k8s.io/karpenter/pkg/utils/pod"
 )
@@ -65,6 +66,10 @@ func (c *PodController) Reconcile(ctx context.Context, p *corev1.Pod) (reconcile
 	ctx = injection.WithControllerName(ctx, c.Name()) //nolint:ineffassign,staticcheck
 
 	if !pod.IsProvisionable(p) {
+		return reconcile.Result{}, nil
+	}
+	// Expendable pods never trigger provisioning and are never ACK'd, so they aren't tracked as undecided
+	if pod.IsExpendable(p, options.FromContext(ctx).ExpendablePodsPriorityCutoff) {
 		return reconcile.Result{}, nil
 	}
 	c.provisioner.Trigger(p.UID)
