@@ -40,6 +40,7 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	schedulingv1 "k8s.io/api/scheduling/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -2262,6 +2263,17 @@ func mostExpensiveInstanceWithZone(zone string) *cloudprovider.InstanceType {
 func fromInt(i int32) *intstr.IntOrString {
 	v := intstr.FromInt32(i)
 	return &v
+}
+
+// ExpectExpendablePriorityClass applies a PriorityClass with a priority of -100, below the -10 cutoff the expendable pod
+// specs use, and deletes it when the spec ends. Pod priority is resolved from a PriorityClass by the Priority admission
+// plugin, which rejects pods that set spec.priority directly.
+func ExpectExpendablePriorityClass(ctx context.Context, c client.Client) *schedulingv1.PriorityClass {
+	GinkgoHelper()
+	priorityClass := &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: test.RandomName()}, Value: -100}
+	ExpectApplied(ctx, c, priorityClass)
+	DeferCleanup(func() { ExpectDeleted(ctx, c, priorityClass) })
+	return priorityClass
 }
 
 // ExpectTaintedNodeCount will assert the number of nodes and tainted nodes in the cluster and return the tainted nodes.

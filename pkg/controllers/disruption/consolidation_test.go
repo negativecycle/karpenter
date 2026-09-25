@@ -31,6 +31,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	schedulingv1 "k8s.io/api/scheduling/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -5302,6 +5303,178 @@ var _ = Describe("Consolidation", func() {
 			// Should not consolidate static NodeClaims
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(0))
+		})
+	})
+	Context("Expendable Pods", func() {
+		var nodeClaims []*v1.NodeClaim
+		var nodes []*corev1.Node
+		var priorityClass *schedulingv1.PriorityClass
+
+		blockedEventMessages := func() []string {
+			return lo.FilterMap(recorder.Events(), func(e events.Event, _ int) (string, bool) {
+				return e.Message, e.Reason == events.DisruptionBlocked
+			})
+		}
+		// useFirstNodeForCapacityOnly stops nodes[0] from being disrupted, so it only provides capacity for other pods
+		useFirstNodeForCapacityOnly := func() {
+			nodeClaims[0].Annotations = lo.Assign(nodeClaims[0].Annotations, map[string]string{v1.DoNotDisruptAnnotationKey: "true"})
+			nodes[0].Annotations = lo.Assign(nodes[0].Annotations, map[string]string{v1.DoNotDisruptAnnotationKey: "true"})
+		}
+		// expendablePodThatFitsNowhere has a node selector that no node or instance type satisfies
+		expendablePodThatFitsNowhere := func() *corev1.Pod {
+			return test.Pod(test.PodOptions{
+				PriorityClassName: priorityClass.Name,
+				NodeSelector:      map[string]string{"example.com/expendable": "nowhere"},
+			})
+		}
+
+		BeforeEach(func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{ExpendablePodsPriorityCutoff: new(int32(-10))}))
+			priorityClass = ExpectExpendablePriorityClass(ctx, env.Client)
+			nodeClaims, nodes = test.NodeClaimsAndNodes(3, v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						v1.NodePoolLabelKey:            nodePool.Name,
+						corev1.LabelInstanceTypeStable: leastExpensiveInstance.Name,
+						v1.CapacityTypeLabelKey:        leastExpensiveOffering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+						corev1.LabelTopologyZone:       leastExpensiveOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+					},
+				},
+				Status: v1.NodeClaimStatus{
+					Allocatable: map[corev1.ResourceName]resource.Quantity{
+						corev1.ResourceCPU:  resource.MustParse("32"),
+						corev1.ResourcePods: resource.MustParse("100"),
+					},
+				},
+			})
+			for _, nc := range nodeClaims {
+				nc.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
+			}
+		})
+		It("should delete a node when an expendable pod on a deleting node fits nowhere", func() {
+			useFirstNodeForCapacityOnly()
+			pods := test.Pods(2, test.PodOptions{})
+			expendablePod := expendablePodThatFitsNowhere()
+			ExpectApplied(ctx, env.Client, nodePool, pods[0], pods[1], expendablePod)
+			for i := range nodeClaims {
+				ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
+			}
+			ExpectManualBinding(ctx, env.Client, pods[0], nodes[0])
+			ExpectManualBinding(ctx, env.Client, pods[1], nodes[1])
+			ExpectManualBinding(ctx, env.Client, expendablePod, nodes[2])
+
+			// inform cluster state about nodes and nodeclaims, then start deleting nodes[2]
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			cluster.MarkForDeletion(nodes[2].Spec.ProviderID)
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			cmds := queue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Decision()).To(Equal(disruption.DeleteDecision))
+			Expect(cmds[0].Candidates).To(ConsistOf(HaveField("NodeClaim.Name", nodeClaims[1].Name)))
+		})
+		It("should delete a node whose other pods fit elsewhere even though its expendable pod fits nowhere", func() {
+			useFirstNodeForCapacityOnly()
+			pods := test.Pods(2, test.PodOptions{})
+			expendablePod := expendablePodThatFitsNowhere()
+			ExpectApplied(ctx, env.Client, nodePool, pods[0], pods[1], expendablePod, nodeClaims[0], nodes[0], nodeClaims[1], nodes[1])
+			ExpectManualBinding(ctx, env.Client, pods[0], nodes[0])
+			ExpectManualBinding(ctx, env.Client, pods[1], nodes[1])
+			ExpectManualBinding(ctx, env.Client, expendablePod, nodes[1])
+
+			// inform cluster state about nodes and nodeclaims
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{nodes[0], nodes[1]}, []*v1.NodeClaim{nodeClaims[0], nodeClaims[1]})
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			cmds := queue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Decision()).To(Equal(disruption.DeleteDecision))
+			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaims[1])
+
+			// Cascade any deletion of the nodeclaim to the node
+			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[1])
+
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
+			ExpectNotFound(ctx, env.Client, nodeClaims[1], nodes[1])
+		})
+		It("should size a replacement without the candidate's expendable pods", func() {
+			pod := test.Pod(test.PodOptions{ResourceRequirements: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+			}})
+			expendablePod := test.Pod(test.PodOptions{
+				PriorityClassName: priorityClass.Name,
+				ResourceRequirements: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("20")},
+				},
+			})
+			ExpectApplied(ctx, env.Client, nodePool, pod, expendablePod, nodeClaim, node)
+			ExpectManualBinding(ctx, env.Client, pod, node)
+			ExpectManualBinding(ctx, env.Client, expendablePod, node)
+
+			// inform cluster state about nodes and nodeclaims
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			// Process the item so that the nodes can be deleted.
+			cmds := queue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Decision()).To(Equal(disruption.ReplaceDecision))
+			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
+			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+			// Cascade any deletion of the nodeclaim to the node
+			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
+
+			// The replacement only requests the normal pod's CPU, not the expendable pod's
+			replacements := ExpectNodeClaims(ctx, env.Client)
+			Expect(replacements).To(HaveLen(1))
+			Expect(replacements[0].Name).ToNot(Equal(nodeClaim.Name))
+			Expect(replacements[0].Spec.Resources.Requests.Cpu().Cmp(resource.MustParse("1"))).To(Equal(0))
+			ExpectNotFound(ctx, env.Client, nodeClaim, node)
+		})
+		It("should not disrupt a node whose expendable pod has the karpenter.sh/do-not-disrupt annotation", func() {
+			// Without the annotation this node would be empty, since its only pod is expendable
+			expendablePod := test.Pod(test.PodOptions{
+				PriorityClassName: priorityClass.Name,
+				ObjectMeta:        metav1.ObjectMeta{Annotations: map[string]string{v1.DoNotDisruptAnnotationKey: "true"}},
+			})
+			ExpectApplied(ctx, env.Client, nodePool, expendablePod, nodeClaims[0], nodes[0])
+			ExpectManualBinding(ctx, env.Client, expendablePod, nodes[0])
+
+			// inform cluster state about nodes and nodeclaims
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{nodes[0]}, []*v1.NodeClaim{nodeClaims[0]})
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			Expect(queue.GetCommands()).To(BeEmpty())
+			Expect(blockedEventMessages()).To(ContainElement(And(ContainSubstring("do-not-disrupt"), ContainSubstring(expendablePod.Name))))
+			ExpectExists(ctx, env.Client, nodeClaims[0])
+		})
+		It("should not disrupt a node whose expendable pod has a fully blocking PDB", func() {
+			// Without the PDB this node would be empty, since its only pod is expendable
+			expendablePod := test.Pod(test.PodOptions{
+				PriorityClassName: priorityClass.Name,
+				ObjectMeta:        metav1.ObjectMeta{Labels: labels},
+			})
+			pdb := test.PodDisruptionBudget(test.PDBOptions{
+				Labels:         labels,
+				MaxUnavailable: fromInt(0),
+				Status: &policyv1.PodDisruptionBudgetStatus{
+					ObservedGeneration: 1,
+					DisruptionsAllowed: 0,
+					CurrentHealthy:     1,
+					DesiredHealthy:     1,
+					ExpectedPods:       1,
+				},
+			})
+			ExpectApplied(ctx, env.Client, nodePool, expendablePod, pdb, nodeClaims[0], nodes[0])
+			ExpectManualBinding(ctx, env.Client, expendablePod, nodes[0])
+
+			// inform cluster state about nodes and nodeclaims
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{nodes[0]}, []*v1.NodeClaim{nodeClaims[0]})
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			Expect(queue.GetCommands()).To(BeEmpty())
+			Expect(blockedEventMessages()).To(ContainElement(And(ContainSubstring("prevents pod evictions"), ContainSubstring(pdb.Name))))
+			ExpectExists(ctx, env.Client, nodeClaims[0])
 		})
 	})
 })

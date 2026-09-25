@@ -37,6 +37,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
+	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -85,6 +86,7 @@ type Candidate struct {
 	capacityType      string
 	DisruptionCost    float64
 	reschedulablePods []*corev1.Pod
+	expendablePods    []*corev1.Pod
 
 	// Price is the cheapest compatible offering price for this candidate.
 	// Precomputed at creation to avoid repeated offering lookups.
@@ -156,6 +158,11 @@ func computeRescheduleDisruptionCost(ctx context.Context, reschedulablePods []*c
 // SavingsRatio returns cost per unit disruption (higher = prefer to disrupt).
 func (c *Candidate) SavingsRatio() float64 { return c.Price / c.RescheduleDisruptionCost }
 
+// disruptedPodCount is the number of pods that disrupting the candidate will evict, excluding DaemonSet and mirror pods
+func (c *Candidate) disruptedPodCount() int {
+	return len(c.reschedulablePods) + len(c.expendablePods)
+}
+
 func (c *Candidate) OwnedByStaticNodePool() bool {
 	return c.NodePool.Spec.Replicas != nil
 }
@@ -222,6 +229,8 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 		}
 	}
 	reschedulable := lo.Filter(pods, func(p *corev1.Pod, _ int) bool { return pod.IsReschedulable(p) })
+	// Expendable pods are still disrupted, but they don't need to reschedule
+	reschedulable, expendable := provisioning.FilterExpendable(ctx, reschedulable)
 	return &Candidate{
 		StateNode:         node,
 		instanceType:      instanceType,
@@ -229,6 +238,7 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 		capacityType:      node.Labels()[v1.CapacityTypeLabelKey],
 		zone:              node.Labels()[corev1.LabelTopologyZone],
 		reschedulablePods: reschedulable,
+		expendablePods:    expendable,
 		// We get the disruption cost from all pods in the candidate, not just the reschedulable pods
 		DisruptionCost:           disruptionutils.ReschedulingCost(ctx, pods) * disruptionutils.LifetimeRemaining(clk, nodePool, node.NodeClaim),
 		Price:                    resolveNodePrice(node, instanceType),
@@ -437,7 +447,7 @@ func (c Command) EmitRejectedEvents(recorder events.Recorder, reason string) {
 }
 
 func (c Command) LogValues() []any {
-	podCount := lo.Reduce(c.Candidates, func(acc int, cd *Candidate, _ int) int { return acc + len(cd.reschedulablePods) }, 0)
+	podCount := lo.Reduce(c.Candidates, func(acc int, cd *Candidate, _ int) int { return acc + cd.disruptedPodCount() }, 0)
 
 	candidateNodes := lo.Map(c.Candidates, func(candidate *Candidate, _ int) any {
 		return map[string]any{
@@ -462,7 +472,7 @@ func (c Command) LogValues() []any {
 		return m
 	})
 
-	return []any{
+	values := []any{
 		"decision", c.Decision(),
 		"disrupted-node-count", len(candidateNodes),
 		"replacement-node-count", len(replacementNodes),
@@ -470,4 +480,9 @@ func (c Command) LogValues() []any {
 		"disrupted-nodes", candidateNodes,
 		"replacement-nodes", replacementNodes,
 	}
+	// Replacements aren't sized for expendable pods, so say how many were left out
+	if expendablePodCount := lo.SumBy(c.Candidates, func(cd *Candidate) int { return len(cd.expendablePods) }); len(c.Replacements) > 0 && expendablePodCount > 0 {
+		values = append(values, "expendable-pod-count", expendablePodCount)
+	}
+	return values
 }

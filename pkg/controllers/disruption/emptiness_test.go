@@ -19,6 +19,7 @@ package disruption_test
 
 import (
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -34,6 +35,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/metrics"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
@@ -916,6 +918,65 @@ var _ = Describe("Emptiness", func() {
 
 			// Node should be deleted — zero buffer pods means it's empty
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(0))
+		})
+	})
+	Context("Expendable Pods", func() {
+		var expendablePod, daemonSetPod *corev1.Pod
+
+		BeforeEach(func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{ExpendablePodsPriorityCutoff: new(int32(-10))}))
+			expendablePod = test.Pod(test.PodOptions{PriorityClassName: ExpectExpendablePriorityClass(ctx, env.Client).Name})
+			ds := test.DaemonSet()
+			ExpectApplied(ctx, env.Client, ds)
+			daemonSetPod = test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion:         "apps/v1",
+					Kind:               "DaemonSet",
+					Name:               ds.Name,
+					UID:                ds.UID,
+					Controller:         new(true),
+					BlockOwnerDeletion: new(true),
+				}},
+			}})
+			metrics.PodsDisruptionInitiatedTotal.Reset()
+		})
+		It("should disrupt a node with only DaemonSet and expendable pods as empty", func() {
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, expendablePod, daemonSetPod)
+			ExpectManualBinding(ctx, env.Client, expendablePod, node)
+			ExpectManualBinding(ctx, env.Client, daemonSetPod, node)
+
+			// inform cluster state about nodes and nodeclaims
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			cmds := queue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Reason()).To(Equal(v1.DisruptionReasonEmpty))
+			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+
+			// Cascade any deletion of the nodeClaim to the node
+			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
+
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(0))
+			ExpectNotFound(ctx, env.Client, nodeClaim, node)
+			// The expendable pod is still disrupted, so it is counted
+			ExpectMetricCounterValue(metrics.PodsDisruptionInitiatedTotal, 1, map[string]string{
+				metrics.ReasonLabel:   strings.ToLower(string(v1.DisruptionReasonEmpty)),
+				metrics.NodePoolLabel: nodePool.Name,
+			})
+		})
+		It("should not consider a node with low priority pods as empty when the cutoff is left at the default", func() {
+			ctx = options.ToContext(ctx, test.Options())
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, expendablePod, daemonSetPod)
+			ExpectManualBinding(ctx, env.Client, expendablePod, node)
+			ExpectManualBinding(ctx, env.Client, daemonSetPod, node)
+
+			// inform cluster state about nodes and nodeclaims
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			Expect(queue.GetCommands()).To(BeEmpty())
+			ExpectExists(ctx, env.Client, nodeClaim)
 		})
 	})
 })

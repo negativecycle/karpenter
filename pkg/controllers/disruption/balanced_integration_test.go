@@ -17,6 +17,7 @@ limitations under the License.
 package disruption_test
 
 import (
+	"context"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -30,6 +31,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/events"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -808,4 +810,46 @@ var _ = Describe("Balanced Consolidation", func() {
 		})
 	})
 
+	Context("Expendable Pods", func() {
+		It("should compute a candidate's reschedule disruption cost and savings ratio without its expendable pods", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{ExpendablePodsPriorityCutoff: new(int32(-10))}))
+			priorityClass := ExpectExpendablePriorityClass(ctx, env.Client)
+			nodeClaims, nodes := test.NodeClaimsAndNodes(2, v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						v1.NodePoolLabelKey:            nodePool.Name,
+						corev1.LabelInstanceTypeStable: leastExpensiveInstance.Name,
+						v1.CapacityTypeLabelKey:        leastExpensiveOffering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+						corev1.LabelTopologyZone:       leastExpensiveOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+					},
+				},
+				Status: v1.NodeClaimStatus{
+					Allocatable: map[corev1.ResourceName]resource.Quantity{
+						corev1.ResourceCPU:  resource.MustParse("32"),
+						corev1.ResourcePods: resource.MustParse("100"),
+					},
+				},
+			})
+			// Both nodes have one normal pod, and nodes[1] also has two expendable pods
+			pods := test.Pods(2, test.PodOptions{})
+			expendablePods := test.Pods(2, test.PodOptions{PriorityClassName: priorityClass.Name})
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaims[0], nodes[0], nodeClaims[1], nodes[1], pods[0], pods[1], expendablePods[0], expendablePods[1])
+			ExpectManualBinding(ctx, env.Client, pods[0], nodes[0])
+			ExpectManualBinding(ctx, env.Client, pods[1], nodes[1])
+			ExpectManualBinding(ctx, env.Client, expendablePods[0], nodes[1])
+			ExpectManualBinding(ctx, env.Client, expendablePods[1], nodes[1])
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+
+			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, func(context.Context, *disruption.Candidate) bool { return true }, disruption.GracefulDisruptionClass, queue)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(candidates).To(HaveLen(2))
+			withoutExpendable, _ := lo.Find(candidates, func(c *disruption.Candidate) bool { return c.Name() == nodes[0].Name })
+			withExpendable, _ := lo.Find(candidates, func(c *disruption.Candidate) bool { return c.Name() == nodes[1].Name })
+
+			Expect(withExpendable.RescheduleDisruptionCost).To(Equal(withoutExpendable.RescheduleDisruptionCost))
+			Expect(withExpendable.SavingsRatio()).To(Equal(withoutExpendable.SavingsRatio()))
+			// DisruptionCost still counts every pod, since the expendable pods are still disrupted
+			Expect(withExpendable.DisruptionCost).To(BeNumerically(">", withoutExpendable.DisruptionCost))
+		})
+	})
 })

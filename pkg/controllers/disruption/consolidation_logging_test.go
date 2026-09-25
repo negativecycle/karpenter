@@ -527,6 +527,53 @@ func TestLogValues_PodCount(t *testing.T) {
 	}
 }
 
+func TestLogValues_ExpendablePodCount(t *testing.T) {
+	c1 := mockCandidate("node-1")
+	c1.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "nc-1"}}
+	c1.reschedulablePods = []*corev1.Pod{{ObjectMeta: metav1.ObjectMeta{Name: "pod-1"}}}
+	c1.expendablePods = []*corev1.Pod{
+		{ObjectMeta: metav1.ObjectMeta{Name: "pod-2"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "pod-3"}},
+	}
+
+	c2 := mockCandidate("node-2")
+	c2.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "nc-2"}}
+	c2.expendablePods = []*corev1.Pod{{ObjectMeta: metav1.ObjectMeta{Name: "pod-4"}}}
+
+	logValue := func(cmd Command, key string) (any, bool) {
+		logValues := cmd.LogValues()
+		for i := 0; i < len(logValues)-1; i += 2 {
+			if logValues[i] == key {
+				return logValues[i+1], true
+			}
+		}
+		return nil, false
+	}
+
+	replace := Command{
+		Candidates:   []*Candidate{c1, c2},
+		Replacements: []*Replacement{{NodeClaim: &scheduling.NodeClaim{}}},
+	}
+	if podCount, _ := logValue(replace, "pod-count"); podCount != 4 {
+		t.Errorf("LogValues() pod-count = %v, want 4 (reschedulable and expendable pods)", podCount)
+	}
+	if expendablePodCount, _ := logValue(replace, "expendable-pod-count"); expendablePodCount != 3 {
+		t.Errorf("LogValues() expendable-pod-count = %v, want 3 (sum of all candidates' expendable pods)", expendablePodCount)
+	}
+
+	// Without a replacement, no capacity is sized, so there's nothing to leave the expendable pods out of
+	del := Command{Candidates: []*Candidate{c1, c2}}
+	if expendablePodCount, ok := logValue(del, "expendable-pod-count"); ok {
+		t.Errorf("LogValues() expendable-pod-count = %v, want it omitted for a command without replacements", expendablePodCount)
+	}
+
+	// With no expendable pods, the key is omitted
+	c1.expendablePods, c2.expendablePods = nil, nil
+	if expendablePodCount, ok := logValue(replace, "expendable-pod-count"); ok {
+		t.Errorf("LogValues() expendable-pod-count = %v, want it omitted when no pods are expendable", expendablePodCount)
+	}
+}
+
 func TestConsolidationCandidateEvent(t *testing.T) {
 	recorder := test.NewEventRecorder()
 

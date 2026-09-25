@@ -99,6 +99,8 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	if err != nil {
 		return scheduling.Results{}, fmt.Errorf("failed to get pods from deleting nodes, %w", err)
 	}
+	// Don't simulate rescheduling expendable pods from deleting nodes, matching Provisioner.Schedule
+	deletingNodePods, _ = provisioning.FilterExpendable(ctx, deletingNodePods)
 	pods = append(pods, deletingNodePods...)
 
 	var opts []scheduling.Options

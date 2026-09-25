@@ -273,7 +273,7 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 			metrics.TerminationModeLabel:     nodeclaimutils.DisruptionTerminationMode(cmd.Candidates[i].NodeClaim),
 		}
 		metrics.NodeClaimsDisruptedTotal.Inc(labels)
-		metrics.PodsDisruptionInitiatedTotal.Add(float64(len(cmd.Candidates[i].reschedulablePods)), labels)
+		metrics.PodsDisruptionInitiatedTotal.Add(float64(cmd.Candidates[i].disruptedPodCount()), labels)
 		// Repair records the eligible condition on the candidate; emit the per-condition/per-image unhealthy-disrupted
 		// metric here (at actual termination), not at command production, so an abandoned command doesn't over-count.
 		if cond := cmd.Candidates[i].RepairCondition; cond != "" {

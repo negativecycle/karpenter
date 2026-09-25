@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/metrics"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -896,6 +897,57 @@ var _ = Describe("Drift", func() {
 			ExpectMetricCounterValue(disruption.DecisionsPerformedTotal, 1, map[string]string{
 				metrics.ReasonLabel: strings.ToLower(string(v1.DisruptionReasonDrifted)),
 			})
+		})
+		It("should drift nodes with only expendable pods before non-empty nodes", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{ExpendablePodsPriorityCutoff: new(int32(-10))}))
+			nodePool.Spec.Disruption.ConsolidateAfter = v1.MustParseNillableDuration("Never")
+			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeDrifted)
+			// nodeClaim drifted first, so by drift time alone it would be disrupted first
+			for i := range nodeClaim.Status.Conditions {
+				if nodeClaim.Status.Conditions[i].Type == v1.ConditionTypeDrifted {
+					nodeClaim.Status.Conditions[i].LastTransitionTime = metav1.Time{Time: time.Now().Add(-time.Hour)}
+				}
+			}
+
+			pod := test.Pod()
+			expendablePod := test.Pod(test.PodOptions{PriorityClassName: ExpectExpendablePriorityClass(ctx, env.Client).Name})
+			nodeClaim2, node2 := test.NodeClaimAndNode(v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						v1.NodePoolLabelKey:            nodePool.Name,
+						corev1.LabelInstanceTypeStable: mostExpensiveInstance.Name,
+						v1.CapacityTypeLabelKey:        mostExpensiveOffering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+						corev1.LabelTopologyZone:       mostExpensiveOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+					},
+				},
+				Status: v1.NodeClaimStatus{
+					ProviderID: test.RandomProviderID(),
+					Allocatable: map[corev1.ResourceName]resource.Quantity{
+						corev1.ResourceCPU:  resource.MustParse("32"),
+						corev1.ResourcePods: resource.MustParse("100"),
+					},
+				},
+			})
+			// nodeClaim2 is disrupted first because its only pod is expendable
+			nodeClaim2.StatusConditions().SetTrue(v1.ConditionTypeDrifted)
+
+			ExpectApplied(ctx, env.Client, pod, expendablePod, nodePool, nodeClaim, nodeClaim2, node, node2)
+			ExpectManualBinding(ctx, env.Client, pod, node)
+			ExpectManualBinding(ctx, env.Client, expendablePod, node2)
+
+			// inform cluster state about nodes and nodeclaims
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node, node2}, []*v1.NodeClaim{nodeClaim, nodeClaim2})
+			ExpectSingletonReconciled(ctx, disruptionController)
+			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim2)
+
+			// Cascade any deletion of the nodeClaim to the node
+			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
+			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim2)
+
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
+			ExpectExists(ctx, env.Client, nodeClaim)
+			ExpectNotFound(ctx, env.Client, nodeClaim2, node2)
 		})
 		It("should delete drifted nodes when they are empty and consolidatable", func() {
 			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeDrifted)
