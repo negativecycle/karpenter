@@ -197,10 +197,10 @@ type StateNode struct {
 	markedForDeletion bool
 	nominatedUntil    metav1.Time
 
-	// schedulerNominatedPods are unbound pods that the kube-scheduler has nominated to this node through
+	// schedulerNominatedPods are the requests of unbound pods that the kube-scheduler has nominated to this node through
 	// status.nominatedNodeName, usually after preempting pods on it to make room. The node shouldn't be disrupted while
-	// they wait to bind.
-	schedulerNominatedPods map[types.NamespacedName]bool
+	// they wait to bind, and scheduling simulations shouldn't place other pods in the room they're waiting for.
+	schedulerNominatedPods map[types.NamespacedName]corev1.ResourceList
 }
 
 func NewNode() *StateNode {
@@ -213,7 +213,7 @@ func NewNode() *StateNode {
 		hostPortUsage:      scheduling.NewHostPortUsage(),
 		volumeUsage:        scheduling.NewVolumeUsage(),
 
-		schedulerNominatedPods: map[types.NamespacedName]bool{},
+		schedulerNominatedPods: map[types.NamespacedName]corev1.ResourceList{},
 	}
 }
 
@@ -458,9 +458,15 @@ func (in *StateNode) Allocatable() corev1.ResourceList {
 	return in.Node.Status.Allocatable
 }
 
-// Available is allocatable minus anything allocated to pods.
+// Available is the node's allocatable resources minus the requests of its bound pods and of the pods the kube-scheduler
+// has nominated to it, which will bind once the pods they preempted exit.
 func (in *StateNode) Available() corev1.ResourceList {
-	return resources.Subtract(in.Allocatable(), in.PodRequests())
+	available := resources.Subtract(in.Allocatable(), in.PodRequests())
+	// Most nodes have no nominated pods, so skip merging an empty map on this hot path
+	if !in.HasSchedulerNominatedPods() {
+		return available
+	}
+	return resources.Subtract(available, in.SchedulerNominatedPodRequests())
 }
 
 func (in *StateNode) DaemonSetRequests() corev1.ResourceList {
@@ -485,6 +491,12 @@ func (in *StateNode) PodRequests() corev1.ResourceList {
 		totalRequests = resources.MergeInto(totalRequests, requests)
 	}
 	return totalRequests
+}
+
+// SchedulerNominatedPodRequests returns the requests of the unbound pods that the kube-scheduler has nominated to this
+// node. They aren't included in PodRequests, which covers only bound pods.
+func (in *StateNode) SchedulerNominatedPodRequests() corev1.ResourceList {
+	return resources.Merge(lo.Values(in.schedulerNominatedPods)...)
 }
 
 func (in *StateNode) PodLimits() corev1.ResourceList {

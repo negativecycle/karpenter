@@ -2630,6 +2630,34 @@ var _ = Context("Scheduling", func() {
 			scheduledNode := ExpectScheduled(ctx, env.Client, pod)
 			Expect(node.Name).To(Equal(scheduledNode.Name))
 		})
+		It("should not schedule a pod into room the kube-scheduler is holding for a nominated pod", func() {
+			node := test.Node(test.NodeOptions{
+				Allocatable: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("10"),
+					corev1.ResourceMemory: resource.MustParse("10Gi"),
+					corev1.ResourcePods:   resource.MustParse("110"),
+				},
+			})
+			ExpectApplied(ctx, env.Client, node)
+			ExpectMakeNodesInitialized(ctx, env.Client, env.Clock, node)
+			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
+
+			// The kube-scheduler has preempted pods on the node to make room for this pod, which binds once they exit
+			nominated := test.UnschedulablePod(test.PodOptions{ResourceRequirements: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("8")},
+			}})
+			nominated.Status.NominatedNodeName = node.Name
+			ExpectApplied(ctx, env.Client, nominated)
+			ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(nominated))
+
+			ExpectApplied(ctx, env.Client, nodePool)
+			pod := test.UnschedulablePod(test.PodOptions{ResourceRequirements: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
+			}})
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+			scheduledNode := ExpectScheduled(ctx, env.Client, pod)
+			Expect(scheduledNode.Name).ToNot(Equal(node.Name))
+		})
 		It("should schedule multiple pods to an existing node unowned by Karpenter", func() {
 			node := test.Node(test.NodeOptions{
 				Allocatable: corev1.ResourceList{

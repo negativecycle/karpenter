@@ -1059,8 +1059,9 @@ var _ = Describe("Nominated Pods", func() {
 	var pod *corev1.Pod
 
 	BeforeEach(func() {
-		node = test.Node(test.NodeOptions{ProviderID: test.RandomProviderID()})
-		node2 = test.Node(test.NodeOptions{ProviderID: test.RandomProviderID()})
+		allocatable := corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")}
+		node = test.Node(test.NodeOptions{ProviderID: test.RandomProviderID(), Allocatable: allocatable})
+		node2 = test.Node(test.NodeOptions{ProviderID: test.RandomProviderID(), Allocatable: allocatable})
 		ExpectApplied(ctx, env.Client, node, node2)
 		ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
 		ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node2))
@@ -1093,6 +1094,45 @@ var _ = Describe("Nominated Pods", func() {
 		ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
 
 		Expect(ExpectStateNodeExists(cluster, node).HasSchedulerNominatedPods()).To(BeTrue())
+	})
+	It("should count a nominated pod's requests against the node's available resources", func() {
+		pod.Spec.Containers[0].Resources.Requests = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")}
+		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")}, ExpectStateNodeExists(cluster, node).Available())
+		ExpectApplied(ctx, env.Client, pod)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(pod))
+
+		stateNode := ExpectStateNodeExists(cluster, node)
+		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")}, stateNode.Available())
+		// The pod isn't running yet, so it isn't reported as one of the node's pod requests
+		Expect(stateNode.PodRequests()).ToNot(HaveKey(corev1.ResourceCPU))
+	})
+	It("should count a nominated pod's requests once after it binds", func() {
+		pod.Spec.Containers[0].Resources.Requests = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")}
+		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")}, ExpectStateNodeExists(cluster, node).Available())
+		ExpectApplied(ctx, env.Client, pod)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(pod))
+		ExpectManualBinding(ctx, env.Client, pod, node)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(pod))
+
+		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")}, ExpectStateNodeExists(cluster, node).Available())
+	})
+	It("should keep a node nominated while another pod is still nominated to it", func() {
+		pod.Spec.Containers[0].Resources.Requests = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")}
+		pod2 := test.UnschedulablePod(test.PodOptions{ResourceRequirements: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
+		}})
+		pod2.Status.NominatedNodeName = node.Name
+		ExpectApplied(ctx, env.Client, pod, pod2)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(pod))
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(pod2))
+		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")}, ExpectStateNodeExists(cluster, node).Available())
+
+		ExpectDeleted(ctx, env.Client, pod2)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(pod2))
+
+		stateNode := ExpectStateNodeExists(cluster, node)
+		Expect(stateNode.HasSchedulerNominatedPods()).To(BeTrue())
+		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")}, stateNode.Available())
 	})
 	It("should clear the nomination when the pod binds", func() {
 		ExpectApplied(ctx, env.Client, pod)

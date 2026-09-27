@@ -133,9 +133,20 @@ func (in *StateNode) DeepCopyInto(out *StateNode) {
 	in.nominatedUntil.DeepCopyInto(&out.nominatedUntil)
 	if in.schedulerNominatedPods != nil {
 		in, out := &in.schedulerNominatedPods, &out.schedulerNominatedPods
-		*out = make(map[types.NamespacedName]bool, len(*in))
+		*out = make(map[types.NamespacedName]v1.ResourceList, len(*in))
 		for key, val := range *in {
-			(*out)[key] = val
+			var outVal map[v1.ResourceName]resource.Quantity
+			if val == nil {
+				(*out)[key] = nil
+			} else {
+				inVal := (*in)[key]
+				in, out := &inVal, &outVal
+				*out = make(v1.ResourceList, len(*in))
+				for key, val := range *in {
+					(*out)[key] = val.DeepCopy()
+				}
+			}
+			(*out)[key] = outVal
 		}
 	}
 }
