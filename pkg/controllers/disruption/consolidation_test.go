@@ -230,6 +230,7 @@ var _ = Describe("Consolidation", func() {
 			Entry("when a candidate is blocked by budgets", WithEmptinessBlockingBudget()),
 			Entry("when candidates are filtered out due to pod churn", WithEmptinessChurn()),
 			Entry("when candidates are filtered out due to candidate being nominated", WithEmptinessNodeNomination()),
+			Entry("when candidates are filtered out due to the kube-scheduler nominating a pod to the candidate", WithEmptinessSchedulerNomination()),
 		)
 		DescribeTable("should correctly report invalidated commands for multi node disruption", func(validatorOpt TestConsolidationValidatorOption) {
 			rs := test.ReplicaSet()
@@ -288,6 +289,7 @@ var _ = Describe("Consolidation", func() {
 			Entry("when candidates are blocked by budgets", WithUnderutilizedBlockingBudget()),
 			Entry("when candidates are filtered out due to pod churn", WithUnderutilizedChurn()),
 			Entry("when candidates are filtered out due to candidate being nominated", WithUnderutilizedNodeNomination()),
+			Entry("when candidates are filtered out due to the kube-scheduler nominating a pod to the candidate", WithUnderutilizedSchedulerNomination()),
 		)
 		DescribeTable("should correctly report invalidated commands for single node disruption", func(validatorOpt TestConsolidationValidatorOption) {
 			rs := test.ReplicaSet()
@@ -331,6 +333,7 @@ var _ = Describe("Consolidation", func() {
 			Entry("when a candidate is blocked by budgets", WithUnderutilizedBlockingBudget()),
 			Entry("when candidates are filtered out due to pod churn", WithUnderutilizedChurn()),
 			Entry("when candidates are filtered out due to candidate being nominated", WithUnderutilizedNodeNomination()),
+			Entry("when candidates are filtered out due to the kube-scheduler nominating a pod to the candidate", WithUnderutilizedSchedulerNomination()),
 		)
 	})
 	Context("Budgets", func() {
@@ -2458,6 +2461,46 @@ var _ = Describe("Consolidation", func() {
 			Expect(ExpectNodes(ctx, env.Client)).To(HaveLen(1))
 			// and delete the old one
 			ExpectNotFound(ctx, env.Client, nodeClaims[1], nodes[1])
+		})
+		It("should not delete a node that a pending pod is nominated to", func() {
+			// create our RS so we can link a pod to it
+			rs := test.ReplicaSet()
+			ExpectApplied(ctx, env.Client, rs)
+			pods := test.Pods(3, test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion:         "apps/v1",
+							Kind:               "ReplicaSet",
+							Name:               rs.Name,
+							UID:                rs.UID,
+							Controller:         new(true),
+							BlockOwnerDeletion: new(true),
+						},
+					}}})
+			// The kube-scheduler has nominated this pod to the second node, so the node's remaining pod fitting elsewhere
+			// doesn't make the node safe to delete
+			preemptor := test.UnschedulablePod()
+			preemptor.Status.NominatedNodeName = nodes[1].Name
+			ExpectApplied(ctx, env.Client, rs, pods[0], pods[1], pods[2], preemptor, nodeClaims[0], nodes[0], nodeClaims[1], nodes[1], nodePool)
+
+			// bind pods to node
+			ExpectManualBinding(ctx, env.Client, pods[0], nodes[0])
+			ExpectManualBinding(ctx, env.Client, pods[1], nodes[0])
+			ExpectManualBinding(ctx, env.Client, pods[2], nodes[1])
+			ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(preemptor))
+
+			// inform cluster state about nodes and nodeclaims
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{nodes[0], nodes[1]}, []*v1.NodeClaim{nodeClaims[0], nodeClaims[1]})
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			for _, cmd := range queue.GetCommands() {
+				for _, candidate := range cmd.Candidates {
+					Expect(candidate.NodeClaim.Name).ToNot(Equal(nodeClaims[1].Name))
+				}
+			}
+			ExpectExists(ctx, env.Client, nodeClaims[1])
+			Expect(recorder.DetectedEvent(fmt.Sprintf(`Node is nominated by the kube-scheduler for a pending pod (Pod=%s)`, client.ObjectKeyFromObject(preemptor)))).To(BeTrue())
 		})
 		It("does not delete nodes with pod churn, deletes nodes without pod churn", func() {
 			// create our RS so we can link a pod to it

@@ -187,6 +187,23 @@ var _ = Describe("Repair", func() {
 		// do-not-disrupt does not block repair: a command is still produced.
 		Expect(queue.GetCommands()).To(HaveLen(1))
 	})
+	// INV-S8: a node the kube-scheduler has nominated a pending pod to is still repaired, like a node carrying
+	// do-not-disrupt. The pod may never bind to an unhealthy node, so its nomination must not strand the node.
+	It("should still repair a node that a pending pod is nominated to", func() {
+		initNode(nodeClaim, node)
+		bindReschedulablePod(node)
+		markUnhealthy(node, "BadNode")
+		env.Clock.Step(31 * time.Minute) // past toleration
+
+		preemptor := test.UnschedulablePod()
+		preemptor.Status.NominatedNodeName = node.Name
+		ExpectApplied(ctx, env.Client, preemptor)
+		ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(preemptor))
+
+		ExpectSingletonReconciled(ctx, repairController)
+		// the nomination does not block repair: a command is still produced.
+		Expect(queue.GetCommands()).To(HaveLen(1))
+	})
 
 	// do-not-repair blocks only on the literal value "true"; any other value does not block repair.
 	It("should still repair a node whose do-not-repair annotation is not \"true\"", func() {

@@ -18,6 +18,7 @@ limitations under the License.
 package disruption_test
 
 import (
+	"fmt"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -753,6 +754,48 @@ var _ = Describe("Emptiness", func() {
 		Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(0))
 		Expect(ExpectNodes(ctx, env.Client)).To(HaveLen(0))
 		ExpectNotFound(ctx, env.Client, nodeClaims[0], nodes[0])
+	})
+	Context("Nominated Pods", func() {
+		var victim, preemptor *corev1.Pod
+
+		BeforeEach(func() {
+			// The kube-scheduler preempts the victim to make room for a pending pod and nominates the pending pod to the
+			// node, which it schedules there once the victim exits. Deleting the node wastes the preemption and leaves the
+			// pod needing new capacity.
+			victim = test.Pod()
+			preemptor = test.UnschedulablePod()
+			preemptor.Status.NominatedNodeName = node.Name
+		})
+		It("should not delete a node whose only pod is a terminating preemption victim", func() {
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, victim, preemptor)
+			ExpectManualBinding(ctx, env.Client, victim, node)
+			ExpectDeletionTimestampSet(ctx, env.Client, victim)
+			ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(preemptor))
+
+			// inform cluster state about nodes and nodeclaims
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			Expect(queue.GetCommands()).To(HaveLen(0))
+			ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(recorder.DetectedEvent(fmt.Sprintf(`Node is nominated by the kube-scheduler for a pending pod (Pod=%s)`, client.ObjectKeyFromObject(preemptor)))).To(BeTrue())
+		})
+		It("should delete the node once the nominated pod is gone", func() {
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, victim, preemptor)
+			ExpectManualBinding(ctx, env.Client, victim, node)
+			ExpectDeletionTimestampSet(ctx, env.Client, victim)
+			ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(preemptor))
+			ExpectDeleted(ctx, env.Client, preemptor)
+			ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(preemptor))
+
+			// inform cluster state about nodes and nodeclaims
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			cmds := queue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Reason()).To(Equal(v1.DisruptionReasonEmpty))
+		})
 	})
 	Context("Static NodePool", func() {
 		It("should not consolidate static NodePool nodes", func() {

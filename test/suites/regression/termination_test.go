@@ -23,11 +23,13 @@ import (
 	"github.com/samber/lo"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	schedulingv1 "k8s.io/api/scheduling/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 
 	"sigs.k8s.io/karpenter/pkg/test"
+	"sigs.k8s.io/karpenter/pkg/utils/resources"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -125,6 +127,51 @@ var _ = Describe("Termination", func() {
 			env.ExpectUpdated(nodePool)
 
 			env.EventuallyExpectNotFound(nodeClaim, node)
+		})
+		It("should not terminate a node that a preempting pod is waiting for", func() {
+			// The victim is slow to terminate, so the node looks empty while the preemptor waits for it to leave
+			victim := test.Pod(test.PodOptions{
+				ResourceRequirements:          corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}},
+				PreStopSleep:                  new(int64(300)),
+				TerminationGracePeriodSeconds: new(int64(300)),
+			})
+
+			By("kicking off provisioning for the victim")
+			env.ExpectCreated(nodeClass, nodePool, victim)
+			nodeClaim := env.EventuallyExpectCreatedNodeClaimCount("==", 1)[0]
+			node := env.EventuallyExpectCreatedNodeCount("==", 1)[0]
+			env.EventuallyExpectHealthy(victim)
+
+			By("creating a higher priority pod that only fits on the node once the victim is gone")
+			Expect(env.Client.Get(env, client.ObjectKeyFromObject(node), node)).To(Succeed())
+			podList := &corev1.PodList{}
+			Expect(env.Client.List(env, podList, client.MatchingFields{"spec.nodeName": node.Name})).To(Succeed())
+			others := lo.Reject(lo.ToSlicePtr(podList.Items), func(p *corev1.Pod, _ int) bool { return p.Name == victim.Name })
+			room := resources.Subtract(node.Status.Allocatable, resources.RequestsForPods(others...))
+			priorityClass := &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: test.RandomName()}, Value: 1000}
+			preemptor := test.Pod(test.PodOptions{
+				NodeSelector:         map[string]string{corev1.LabelHostname: node.Labels[corev1.LabelHostname]},
+				PriorityClassName:    priorityClass.Name,
+				ResourceRequirements: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: room[corev1.ResourceCPU]}},
+			})
+			env.ExpectCreated(priorityClass, preemptor)
+
+			// The kube-scheduler preempts the victim and nominates the node for the preemptor
+			Eventually(func(g Gomega) {
+				g.Expect(env.Client.Get(env, client.ObjectKeyFromObject(preemptor), preemptor)).To(Succeed())
+				g.Expect(preemptor.Status.NominatedNodeName).To(Equal(node.Name))
+			}).Should(Succeed())
+			env.EventuallyExpectTerminating(victim)
+
+			By("expecting the node to stay while the preemptor waits for it")
+			env.EventuallyExpectConsolidatable(nodeClaim)
+			env.ConsistentlyExpectNoDisruptions(1, time.Minute)
+
+			By("expecting the preemptor to bind to the node once the victim is gone")
+			Expect(env.Client.Delete(env, victim, client.GracePeriodSeconds(0))).To(Succeed())
+			env.EventuallyExpectBound(preemptor)
+			Expect(env.Client.Get(env, client.ObjectKeyFromObject(preemptor), preemptor)).To(Succeed())
+			Expect(preemptor.Spec.NodeName).To(Equal(node.Name))
 		})
 	})
 	Describe("TerminationGracePeriod", func() {

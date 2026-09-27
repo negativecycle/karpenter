@@ -100,6 +100,32 @@ func IgnoreNodeDoNotDisruptError(err error) error {
 	return err
 }
 
+// SchedulerNominatedError is returned by ValidateNodeDisruptable when the kube-scheduler has nominated a pending pod to
+// the node, usually after preempting pods on it to make room. It is a distinct type so the repair path can ignore it: a
+// pod may never bind to an unhealthy node, so a nomination must not hold the node back from repair.
+type SchedulerNominatedError struct {
+	error
+}
+
+func NewSchedulerNominatedError(err error) *SchedulerNominatedError {
+	return &SchedulerNominatedError{error: err}
+}
+
+func IsSchedulerNominatedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var schedulerNominatedError *SchedulerNominatedError
+	return stderrors.As(err, &schedulerNominatedError)
+}
+
+func IgnoreSchedulerNominatedError(err error) error {
+	if IsSchedulerNominatedError(err) {
+		return nil
+	}
+	return err
+}
+
 //go:generate go tool -modfile=../../../go.tools.mod controller-gen object:headerFile="../../../hack/boilerplate.go.txt" paths="."
 
 // StateNodes is a typed version of a list of *Node
@@ -170,6 +196,11 @@ type StateNode struct {
 	// of the karpenter.sh/disruption taint to know when a node is marked for deletion.
 	markedForDeletion bool
 	nominatedUntil    metav1.Time
+
+	// schedulerNominatedPods are unbound pods that the kube-scheduler has nominated to this node through
+	// status.nominatedNodeName, usually after preempting pods on it to make room. The node shouldn't be disrupted while
+	// they wait to bind.
+	schedulerNominatedPods map[types.NamespacedName]bool
 }
 
 func NewNode() *StateNode {
@@ -181,6 +212,8 @@ func NewNode() *StateNode {
 		podDisruptionCosts: map[types.NamespacedName]float64{},
 		hostPortUsage:      scheduling.NewHostPortUsage(),
 		volumeUsage:        scheduling.NewVolumeUsage(),
+
+		schedulerNominatedPods: map[types.NamespacedName]bool{},
 	}
 }
 
@@ -197,6 +230,8 @@ func (in *StateNode) ShallowCopy() *StateNode {
 		volumeUsage:        in.volumeUsage,
 		markedForDeletion:  in.markedForDeletion,
 		nominatedUntil:     in.nominatedUntil,
+
+		schedulerNominatedPods: in.schedulerNominatedPods,
 	}
 }
 
@@ -259,6 +294,11 @@ func (in *StateNode) ValidateNodeDisruptable(clk clock.Clock) error {
 	// check whether the node has the NodePool label
 	if _, ok := in.Labels()[v1.NodePoolLabelKey]; !ok {
 		return serrors.Wrap(fmt.Errorf("node doesn't have required label"), "label", v1.NodePoolLabelKey)
+	}
+	// This is checked last so that callers which ignore it (repair) still get every other check
+	if in.HasSchedulerNominatedPods() {
+		podKey := lo.MinBy(lo.Keys(in.schedulerNominatedPods), func(a, b types.NamespacedName) bool { return a.String() < b.String() })
+		return NewSchedulerNominatedError(serrors.Wrap(fmt.Errorf("node is nominated by the kube-scheduler for a pending pod"), "Pod", klog.KRef(podKey.Namespace, podKey.Name)))
 	}
 	return nil
 }
@@ -481,6 +521,11 @@ func (in *StateNode) Nominate(ctx context.Context, clk clock.Clock) {
 
 func (in *StateNode) Nominated(clk clock.Clock) bool {
 	return in.nominatedUntil.After(clk.Now())
+}
+
+// HasSchedulerNominatedPods returns true if the kube-scheduler has nominated an unbound pod to this node
+func (in *StateNode) HasSchedulerNominatedPods() bool {
+	return len(in.schedulerNominatedPods) > 0
 }
 
 func (in *StateNode) Managed() bool {

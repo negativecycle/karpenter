@@ -17,6 +17,7 @@ limitations under the License.
 package disruption_test
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -439,6 +440,23 @@ var _ = Describe("Drift", func() {
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
 			Expect(ExpectNodes(ctx, env.Client)).To(HaveLen(1))
 			ExpectExists(ctx, env.Client, nodeClaim)
+		})
+		It("should ignore nodes that the kube-scheduler has nominated a pending pod to", func() {
+			preemptor := test.UnschedulablePod()
+			preemptor.Status.NominatedNodeName = node.Name
+			ExpectApplied(ctx, env.Client, nodeClaim, node, nodePool, preemptor)
+			ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(preemptor))
+
+			// inform cluster state about nodes and nodeclaims
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			// Expect to not create or delete more nodeclaims
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
+			Expect(ExpectNodes(ctx, env.Client)).To(HaveLen(1))
+			ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(recorder.DetectedEvent(fmt.Sprintf(`Node is nominated by the kube-scheduler for a pending pod (Pod=%s)`, client.ObjectKeyFromObject(preemptor)))).To(BeTrue())
 		})
 		It("should delete drifted nodes with the karpenter.sh/do-not-disrupt annotation set to false", func() {
 			node.Annotations = lo.Assign(node.Annotations, map[string]string{v1.DoNotDisruptAnnotationKey: "false"})

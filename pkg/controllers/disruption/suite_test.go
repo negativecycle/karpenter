@@ -76,6 +76,7 @@ var draController *deviceallocation.Controller
 var cloudProvider *fake.CloudProvider
 var nodeStateController *informer.NodeController
 var nodeClaimStateController *informer.NodeClaimController
+var podStateController *informer.PodController
 var recorder *test.EventRecorder
 var queue *disruption.Queue
 var allKnownDisruptionReasons []v1.DisruptionReason
@@ -102,6 +103,7 @@ var _ = BeforeSuite(func() {
 	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider)
 	nodeStateController = informer.NewNodeController(env.Client, cluster)
 	nodeClaimStateController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster, clusterCost)
+	podStateController = informer.NewPodController(env.Client, cluster)
 	recorder = test.NewEventRecorder()
 	draController = deviceallocation.NewController(env.Client)
 	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client))
@@ -1739,6 +1741,29 @@ var _ = Describe("Candidate Filtering", func() {
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(`validating node for disruption, node is nominated for a pending pod (Node=%s)`, node.Name)))
 		Expect(recorder.DetectedEvent("Node is nominated for a pending pod")).To(BeTrue())
+	})
+	It("should not consider candidates that the kube-scheduler has nominated a pod to", func() {
+		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{
+					v1.NodePoolLabelKey:            nodePool.Name,
+					corev1.LabelInstanceTypeStable: mostExpensiveInstance.Name,
+					v1.CapacityTypeLabelKey:        mostExpensiveOffering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+					corev1.LabelTopologyZone:       mostExpensiveOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+				},
+			},
+		})
+		pod := test.UnschedulablePod()
+		pod.Status.NominatedNodeName = node.Name
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, pod)
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(pod))
+
+		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
+		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(Equal(fmt.Sprintf(`validating node for disruption, node is nominated by the kube-scheduler for a pending pod (Pod=%s) (Node=%s)`, client.ObjectKeyFromObject(pod), node.Name)))
+		Expect(recorder.DetectedEvent(fmt.Sprintf(`Node is nominated by the kube-scheduler for a pending pod (Pod=%s)`, client.ObjectKeyFromObject(pod)))).To(BeTrue())
 	})
 	It("should not consider candidates that are deleting", func() {
 		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{

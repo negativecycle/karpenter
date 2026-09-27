@@ -180,10 +180,12 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 	}
 	err = node.ValidateNodeDisruptable(clk)
 	// Repair is voluntary but is NOT discretionary: a node carrying do-not-disrupt must still be repairable, since
-	// do-not-disrupt was never meant to strand a broken node (repair honors do-not-repair instead). So for the repair
-	// class we ignore the do-not-disrupt block; all other block reasons still apply. (Ignoring is a no-op on a nil err.)
+	// do-not-disrupt was never meant to strand a broken node (repair honors do-not-repair instead). A node the
+	// kube-scheduler has nominated a pending pod to must still be repairable too, since the pod may never bind to an
+	// unhealthy node. So for the repair class we ignore both blocks; all other block reasons still apply. (Ignoring is a
+	// no-op on a nil err.)
 	if disruptionClass == RepairDisruptionClass {
-		err = state.IgnoreNodeDoNotDisruptError(err)
+		err = state.IgnoreSchedulerNominatedError(state.IgnoreNodeDoNotDisruptError(err))
 	}
 	if err != nil {
 		// Only emit an event if the NodeClaim is not nil, ensuring that we only emit events for Karpenter-managed nodes

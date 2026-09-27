@@ -24,6 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
@@ -57,13 +58,15 @@ func NewMethodsWithNopValidator() []disruption.Method {
 }
 
 type TestEmptinessValidator struct {
-	blocked    bool
-	churn      bool
-	nominated  bool
-	nodes      []*corev1.Node
-	nodeClaims []*v1.NodeClaim
-	nodePool   *v1.NodePool
-	emptiness  *disruption.EmptinessValidator
+	blocked   bool
+	churn     bool
+	nominated bool
+	// schedulerNominated nominates a pending pod to each node the way the kube-scheduler does after preempting
+	schedulerNominated bool
+	nodes              []*corev1.Node
+	nodeClaims         []*v1.NodeClaim
+	nodePool           *v1.NodePool
+	emptiness          *disruption.EmptinessValidator
 }
 
 type TestEmptinessValidatorOption func(*TestEmptinessValidator)
@@ -83,6 +86,12 @@ func WithEmptinessBlockingBudget() TestEmptinessValidatorOption {
 func WithEmptinessNodeNomination() TestEmptinessValidatorOption {
 	return func(v *TestEmptinessValidator) {
 		v.nominated = true
+	}
+}
+
+func WithEmptinessSchedulerNomination() TestEmptinessValidatorOption {
+	return func(v *TestEmptinessValidator) {
+		v.schedulerNominated = true
 	}
 }
 
@@ -109,16 +118,21 @@ func (t *TestEmptinessValidator) Validate(ctx context.Context, cmd disruption.Co
 	if t.nominated {
 		nominated(t.nodes, t.nodeClaims)
 	}
+	if t.schedulerNominated {
+		schedulerNominated(t.nodes, t.nodeClaims)
+	}
 	return t.emptiness.Validate(ctx, cmd, 0)
 }
 
 type TestConsolidationValidator struct {
-	blocked       bool
-	churn         bool
-	nominated     bool
-	cluster       *state.Cluster
-	nodePool      *v1.NodePool
-	consolidation *disruption.ConsolidationValidator
+	blocked   bool
+	churn     bool
+	nominated bool
+	// schedulerNominated nominates a pending pod to each node the way the kube-scheduler does after preempting
+	schedulerNominated bool
+	cluster            *state.Cluster
+	nodePool           *v1.NodePool
+	consolidation      *disruption.ConsolidationValidator
 }
 
 type TestConsolidationValidatorOption func(*TestConsolidationValidator)
@@ -138,6 +152,12 @@ func WithUnderutilizedBlockingBudget() TestConsolidationValidatorOption {
 func WithUnderutilizedNodeNomination() TestConsolidationValidatorOption {
 	return func(v *TestConsolidationValidator) {
 		v.nominated = true
+	}
+}
+
+func WithUnderutilizedSchedulerNomination() TestConsolidationValidatorOption {
+	return func(v *TestConsolidationValidator) {
+		v.schedulerNominated = true
 	}
 }
 
@@ -178,6 +198,9 @@ func (t *TestConsolidationValidator) Validate(ctx context.Context, cmd disruptio
 	if t.nominated {
 		nominated(nodes, nodeClaims)
 	}
+	if t.schedulerNominated {
+		schedulerNominated(nodes, nodeClaims)
+	}
 	return t.consolidation.Validate(ctx, cmd, 0)
 }
 
@@ -217,6 +240,16 @@ func blockingBudget(nodes []*corev1.Node, nodeClaims []*v1.NodeClaim, nodePool *
 		Nodes: "0%",
 	}}
 	ExpectApplied(ctx, env.Client, nodePool)
+}
+
+func schedulerNominated(nodes []*corev1.Node, nodeClaims []*v1.NodeClaim) {
+	ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+	for i := range nodes {
+		pod := test.UnschedulablePod()
+		pod.Status.NominatedNodeName = nodes[i].Name
+		ExpectApplied(ctx, env.Client, pod)
+		ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(pod))
+	}
 }
 
 func nominated(nodes []*corev1.Node, nodeClaims []*v1.NodeClaim) {

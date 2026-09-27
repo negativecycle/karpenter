@@ -60,6 +60,7 @@ type Cluster struct {
 	mu                        sync.RWMutex
 	nodes                     map[string]*StateNode           // provider id -> cached node
 	bindings                  map[types.NamespacedName]string // pod namespaced named -> node name
+	schedulerNominations      map[types.NamespacedName]string // unbound pod namespaced name -> node the kube-scheduler nominated it to
 	nodeNameToProviderID      map[string]string               // node name -> provider id
 	nodeClaimNameToProviderID map[string]string               // node claim name -> provider id
 	nodePoolResources         map[string]corev1.ResourceList  // node pool name -> resource list
@@ -108,6 +109,7 @@ func NewCluster(clk clock.Clock, client client.Client, cloudProvider cloudprovid
 		cloudProvider:             cloudProvider,
 		nodes:                     map[string]*StateNode{},
 		bindings:                  map[types.NamespacedName]string{},
+		schedulerNominations:      map[types.NamespacedName]string{},
 		daemonSetPods:             sync.Map{},
 		nodeNameToProviderID:      map[string]string{},
 		nodeClaimNameToProviderID: map[string]string{},
@@ -435,6 +437,7 @@ func (c *Cluster) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
 	} else {
 		err = c.updateNodeUsageFromPod(ctx, pod)
 	}
+	c.updateSchedulerNomination(pod)
 	c.updatePodAntiAffinities(pod)
 	return err
 }
@@ -581,6 +584,7 @@ func (c *Cluster) DeletePod(podKey types.NamespacedName) {
 
 	c.antiAffinityPods.Delete(podKey)
 	c.updateNodeUsageFromPodCompletion(podKey)
+	c.clearSchedulerNomination(podKey)
 	c.ClearPodSchedulingMappings(podKey)
 	c.MarkUnconsolidated()
 }
@@ -647,6 +651,7 @@ func (c *Cluster) Reset() {
 	c.NodePoolState.Reset()
 	c.nodePoolResources = map[string]corev1.ResourceList{}
 	c.bindings = map[types.NamespacedName]string{}
+	c.schedulerNominations = map[types.NamespacedName]string{}
 	c.antiAffinityPods = sync.Map{}
 	c.daemonSetPods = sync.Map{}
 	c.podAcks = sync.Map{}
@@ -717,6 +722,8 @@ func (c *Cluster) newStateFromNodeClaim(nodeClaim *v1.NodeClaim, oldNode *StateN
 		volumeUsage:       oldNode.volumeUsage,
 		markedForDeletion: oldNode.markedForDeletion,
 		nominatedUntil:    oldNode.nominatedUntil,
+
+		schedulerNominatedPods: oldNode.schedulerNominatedPods,
 	}
 	// Cleanup the old nodeClaim with its old providerID if its providerID changes
 	// This can happen since nodes don't get created with providerIDs. Rather, CCM picks up the
@@ -765,6 +772,8 @@ func (c *Cluster) newStateFromNode(ctx context.Context, node *corev1.Node, oldNo
 		volumeUsage:       scheduling.NewVolumeUsage(),
 		markedForDeletion: oldNode.markedForDeletion,
 		nominatedUntil:    oldNode.nominatedUntil,
+
+		schedulerNominatedPods: c.schedulerNominatedPodsFor(node.Name),
 	}
 	if err := multierr.Combine(
 		c.populateResourceRequests(ctx, n),
@@ -949,6 +958,56 @@ func (c *Cluster) updatePodAntiAffinities(pod *corev1.Pod) {
 	} else {
 		c.antiAffinityPods.Delete(podKey)
 	}
+}
+
+// updateSchedulerNomination records the node the kube-scheduler has nominated an unbound pod to, usually after
+// preempting pods on it to make room, so that disruption doesn't remove the node the pod is waiting for. The nomination
+// is dropped once the pod binds, finishes or starts terminating, or when the kube-scheduler clears or moves it.
+func (c *Cluster) updateSchedulerNomination(pod *corev1.Pod) {
+	podKey := client.ObjectKeyFromObject(pod)
+	nodeName := ""
+	if pod.Spec.NodeName == "" && !podutils.IsTerminal(pod) && !podutils.IsTerminating(pod) {
+		nodeName = pod.Status.NominatedNodeName
+	}
+	// Nothing changed. This includes pods that aren't nominated and weren't before, since a missing entry reads as ""
+	if c.schedulerNominations[podKey] == nodeName {
+		return
+	}
+	c.clearSchedulerNomination(podKey)
+	if nodeName == "" {
+		return
+	}
+	c.schedulerNominations[podKey] = nodeName
+	if n, ok := c.nodes[c.nodeNameToProviderID[nodeName]]; ok {
+		if n.schedulerNominatedPods == nil {
+			n.schedulerNominatedPods = map[types.NamespacedName]bool{}
+		}
+		n.schedulerNominatedPods[podKey] = true
+	}
+}
+
+// clearSchedulerNomination drops a pod's scheduler nomination, which may make its node disruptable again
+func (c *Cluster) clearSchedulerNomination(podKey types.NamespacedName) {
+	nodeName, ok := c.schedulerNominations[podKey]
+	if !ok {
+		return
+	}
+	delete(c.schedulerNominations, podKey)
+	if n, ok := c.nodes[c.nodeNameToProviderID[nodeName]]; ok {
+		delete(n.schedulerNominatedPods, podKey)
+	}
+	c.MarkUnconsolidated()
+}
+
+// schedulerNominatedPodsFor returns the unbound pods that the kube-scheduler has nominated to the named node
+func (c *Cluster) schedulerNominatedPodsFor(nodeName string) map[types.NamespacedName]bool {
+	schedulerNominatedPods := map[types.NamespacedName]bool{}
+	for podKey, nominatedNodeName := range c.schedulerNominations {
+		if nominatedNodeName == nodeName {
+			schedulerNominatedPods[podKey] = true
+		}
+	}
+	return schedulerNominatedPods
 }
 
 func (c *Cluster) triggerConsolidationOnChange(old, new *StateNode) {

@@ -1054,6 +1054,91 @@ var _ = Describe("Node Resource Level", func() {
 	})
 })
 
+var _ = Describe("Nominated Pods", func() {
+	var node, node2 *corev1.Node
+	var pod *corev1.Pod
+
+	BeforeEach(func() {
+		node = test.Node(test.NodeOptions{ProviderID: test.RandomProviderID()})
+		node2 = test.Node(test.NodeOptions{ProviderID: test.RandomProviderID()})
+		ExpectApplied(ctx, env.Client, node, node2)
+		ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
+		ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node2))
+		// The kube-scheduler nominates a pending pod to a node after preempting pods on it to make room
+		pod = test.UnschedulablePod()
+		pod.Status.NominatedNodeName = node.Name
+	})
+	It("should record a pending pod the kube-scheduler has nominated to a node", func() {
+		ExpectApplied(ctx, env.Client, pod)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(pod))
+
+		Expect(ExpectStateNodeExists(cluster, node).HasSchedulerNominatedPods()).To(BeTrue())
+		Expect(ExpectStateNodeExists(cluster, node2).HasSchedulerNominatedPods()).To(BeFalse())
+	})
+	It("should record a nomination made before the node is known", func() {
+		node3 := test.Node(test.NodeOptions{ProviderID: test.RandomProviderID()})
+		pod.Status.NominatedNodeName = node3.Name
+		ExpectApplied(ctx, env.Client, pod)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(pod))
+		ExpectApplied(ctx, env.Client, node3)
+		ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node3))
+
+		Expect(ExpectStateNodeExists(cluster, node3).HasSchedulerNominatedPods()).To(BeTrue())
+	})
+	It("should keep the nomination when the node's state is rebuilt", func() {
+		ExpectApplied(ctx, env.Client, pod)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(pod))
+		node.Labels = lo.Assign(node.Labels, map[string]string{"test": "rebuild"})
+		ExpectApplied(ctx, env.Client, node)
+		ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
+
+		Expect(ExpectStateNodeExists(cluster, node).HasSchedulerNominatedPods()).To(BeTrue())
+	})
+	It("should clear the nomination when the pod binds", func() {
+		ExpectApplied(ctx, env.Client, pod)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(pod))
+		ExpectManualBinding(ctx, env.Client, pod, node)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(pod))
+
+		Expect(ExpectStateNodeExists(cluster, node).HasSchedulerNominatedPods()).To(BeFalse())
+	})
+	It("should clear the nomination when the kube-scheduler clears it", func() {
+		ExpectApplied(ctx, env.Client, pod)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(pod))
+		pod.Status.NominatedNodeName = ""
+		ExpectApplied(ctx, env.Client, pod)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(pod))
+
+		Expect(ExpectStateNodeExists(cluster, node).HasSchedulerNominatedPods()).To(BeFalse())
+	})
+	It("should move the nomination when the kube-scheduler nominates another node", func() {
+		ExpectApplied(ctx, env.Client, pod)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(pod))
+		pod.Status.NominatedNodeName = node2.Name
+		ExpectApplied(ctx, env.Client, pod)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(pod))
+
+		Expect(ExpectStateNodeExists(cluster, node).HasSchedulerNominatedPods()).To(BeFalse())
+		Expect(ExpectStateNodeExists(cluster, node2).HasSchedulerNominatedPods()).To(BeTrue())
+	})
+	It("should clear the nomination when the pod starts terminating", func() {
+		ExpectApplied(ctx, env.Client, pod)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(pod))
+		ExpectDeletionTimestampSet(ctx, env.Client, pod)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(pod))
+
+		Expect(ExpectStateNodeExists(cluster, node).HasSchedulerNominatedPods()).To(BeFalse())
+	})
+	It("should clear the nomination when the pod is deleted", func() {
+		ExpectApplied(ctx, env.Client, pod)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(pod))
+		ExpectDeleted(ctx, env.Client, pod)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(pod))
+
+		Expect(ExpectStateNodeExists(cluster, node).HasSchedulerNominatedPods()).To(BeFalse())
+	})
+})
+
 var _ = Describe("Pod Anti-Affinity", func() {
 	It("should track pods with required anti-affinity", func() {
 		pod := test.UnschedulablePod(test.PodOptions{
